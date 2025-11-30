@@ -134,10 +134,14 @@ class TradingConfig:
     position_sizes: Tuple[float, ...] = (0.25, 0.5, 0.75, 1.0)
 
     # Reward shaping
-    fomo_penalty: float = -0.5      # Penalty for being flat during momentum
-    chop_penalty: float = -0.3      # Penalty for holding in ranging market
+    # NOTE: Penalties are now scaled higher to compete with PnL rewards.
+    # With reward_scaling=0.1, a ±20 pip trade becomes ±2.0 reward,
+    # making penalties (-2.0, -1.0) meaningful for "Sniper" behavior.
+    fomo_penalty: float = -2.0      # Penalty for being flat during momentum
+    chop_penalty: float = -1.0      # Penalty for holding in ranging market
     fomo_threshold_atr: float = 2.0 # ATR multiplier for FOMO detection
     chop_threshold: float = 60.0    # Choppiness index threshold
+    reward_scaling: float = 0.1     # Scale PnL to balance with penalties
 
     # Environment settings
     max_steps_per_episode: int = 2000

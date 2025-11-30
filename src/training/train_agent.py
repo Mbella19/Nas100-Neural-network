@@ -405,11 +405,12 @@ def create_trading_env(
     """
     # Default configuration
     spread_pips = 1.5
-    fomo_penalty = -0.5
-    chop_penalty = -0.3
+    fomo_penalty = -2.0     # Increased for better balance
+    chop_penalty = -1.0     # Increased for better balance
     fomo_threshold_atr = 2.0
     chop_threshold = 60.0
     max_steps = 2000
+    reward_scaling = 0.1    # Scale PnL to balance with penalties
     context_dim = 64
 
     if config is not None:
@@ -419,6 +420,7 @@ def create_trading_env(
         fomo_threshold_atr = getattr(config, 'fomo_threshold_atr', fomo_threshold_atr)
         chop_threshold = getattr(config, 'chop_threshold', chop_threshold)
         max_steps = getattr(config, 'max_steps_per_episode', max_steps)
+        reward_scaling = getattr(config, 'reward_scaling', reward_scaling)
 
     if analyst_model is not None:
         context_dim = analyst_model.context_dim
@@ -437,6 +439,7 @@ def create_trading_env(
         fomo_threshold_atr=fomo_threshold_atr,
         chop_threshold=chop_threshold,
         max_steps=max_steps,
+        reward_scaling=reward_scaling,
         device=device
     )
 

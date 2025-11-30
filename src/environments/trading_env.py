@@ -57,11 +57,12 @@ class TradingEnv(gym.Env):
         lookback_1h: int = 24,
         lookback_4h: int = 12,
         spread_pips: float = 1.5,
-        fomo_penalty: float = -0.5,
-        chop_penalty: float = -0.3,
+        fomo_penalty: float = -2.0,   # Increased from -0.5 for better balance
+        chop_penalty: float = -1.0,   # Increased from -0.3 for better balance
         fomo_threshold_atr: float = 2.0,
         chop_threshold: float = 60.0,
         max_steps: int = 2000,
+        reward_scaling: float = 0.1,  # Scale PnL rewards to balance with penalties
         device: Optional[torch.device] = None
     ):
         """
@@ -83,6 +84,8 @@ class TradingEnv(gym.Env):
             fomo_threshold_atr: ATR multiplier for FOMO detection
             chop_threshold: Choppiness index threshold
             max_steps: Maximum steps per episode
+            reward_scaling: Scale factor for PnL rewards (0.1 = ±20 pips becomes ±2.0)
+                           This balances PnL with penalties for "Sniper" behavior.
             device: Torch device for analyst inference
         """
         super().__init__()
@@ -111,6 +114,7 @@ class TradingEnv(gym.Env):
         self.fomo_threshold_atr = fomo_threshold_atr
         self.chop_threshold = chop_threshold
         self.max_steps = max_steps
+        self.reward_scaling = reward_scaling  # Scale PnL to balance with penalties
 
         # Calculate valid range (need enough lookback data)
         self.start_idx = max(lookback_15m, lookback_1h * 4, lookback_4h * 16)
@@ -310,13 +314,15 @@ class TradingEnv(gym.Env):
         pip_value = 0.0001
 
         # Handle position changes
+        # NOTE: PnL rewards are scaled by self.reward_scaling to balance with penalties
+        # This prevents the agent from ignoring "Sniper" logic when potential PnL is high
         if direction == 0:  # Flat/Exit
             if self.position != 0:
                 # Close existing position
                 pnl = self._calculate_unrealized_pnl()
-                reward += pnl
+                reward += pnl * self.reward_scaling  # Scaled PnL reward
                 info['trade_closed'] = True
-                info['pnl'] = pnl
+                info['pnl'] = pnl  # Unscaled for tracking
                 self.total_pnl += pnl
                 self.trades.append({
                     'entry': self.entry_price,
@@ -332,7 +338,7 @@ class TradingEnv(gym.Env):
         elif direction == 1:  # Long
             if self.position == -1:  # Close short first
                 pnl = self._calculate_unrealized_pnl()
-                reward += pnl
+                reward += pnl * self.reward_scaling  # Scaled PnL reward
                 info['trade_closed'] = True
                 info['pnl'] = pnl
                 self.total_pnl += pnl
@@ -348,13 +354,13 @@ class TradingEnv(gym.Env):
                 self.position = 1
                 self.position_size = new_size
                 self.entry_price = current_price
-                reward -= self.spread_pips * new_size  # Transaction cost
+                reward -= self.spread_pips * new_size * self.reward_scaling  # Scaled cost
                 info['trade_opened'] = True
 
         elif direction == 2:  # Short
             if self.position == 1:  # Close long first
                 pnl = self._calculate_unrealized_pnl()
-                reward += pnl
+                reward += pnl * self.reward_scaling  # Scaled PnL reward
                 info['trade_closed'] = True
                 info['pnl'] = pnl
                 self.total_pnl += pnl
@@ -370,7 +376,7 @@ class TradingEnv(gym.Env):
                 self.position = -1
                 self.position_size = new_size
                 self.entry_price = current_price
-                reward -= self.spread_pips * new_size  # Transaction cost
+                reward -= self.spread_pips * new_size * self.reward_scaling  # Scaled cost
                 info['trade_opened'] = True
 
         # FOMO penalty: flat during high momentum move

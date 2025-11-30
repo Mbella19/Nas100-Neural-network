@@ -177,23 +177,26 @@ def step_3b_normalize_features(
         if col in df_15m.columns:
             logger.info(f"  {col}: min={df_15m[col].min():.6f}, max={df_15m[col].max():.6f}")
 
-    # Normalize all timeframes using training data statistics
-    df_15m_norm, df_1h_norm, df_4h_norm, normalizer = normalize_multi_timeframe(
+    # Normalize all timeframes using SEPARATE normalizers per timeframe
+    df_15m_norm, df_1h_norm, df_4h_norm, normalizers = normalize_multi_timeframe(
         df_15m, df_1h, df_4h,
         feature_cols,
         train_end_idx=train_end_idx
     )
 
-    # Log post-normalization statistics
+    # Log post-normalization statistics for each timeframe
     logger.info("Post-normalization feature ranges (should be ~[-3, 3]):")
-    for col in feature_cols[:6]:
-        if col in df_15m_norm.columns:
-            logger.info(f"  {col}: min={df_15m_norm[col].min():.3f}, max={df_15m_norm[col].max():.3f}")
+    for tf, df_norm in [('15m', df_15m_norm), ('1h', df_1h_norm), ('4h', df_4h_norm)]:
+        logger.info(f"  {tf}:")
+        for col in feature_cols[:3]:  # First 3 features
+            if col in df_norm.columns:
+                logger.info(f"    {col}: min={df_norm[col].min():.3f}, max={df_norm[col].max():.3f}")
 
-    # Save normalizer for inference
-    normalizer_path = config.paths.models_analyst / 'normalizer.pkl'
-    normalizer.save(normalizer_path)
-    logger.info(f"Normalizer saved to {normalizer_path}")
+    # Save normalizers for inference (one per timeframe)
+    for tf, normalizer in normalizers.items():
+        normalizer_path = config.paths.models_analyst / f'normalizer_{tf}.pkl'
+        normalizer.save(normalizer_path)
+    logger.info(f"Normalizers saved to {config.paths.models_analyst}")
 
     # Save normalized data
     processed_path = config.paths.data_processed
@@ -202,7 +205,7 @@ def step_3b_normalize_features(
     df_4h_norm.to_parquet(processed_path / 'features_4h_normalized.parquet')
     logger.info(f"Saved normalized data to {processed_path}")
 
-    return df_15m_norm, df_1h_norm, df_4h_norm, normalizer
+    return df_15m_norm, df_1h_norm, df_4h_norm, normalizers
 
 
 def step_4_train_analyst(

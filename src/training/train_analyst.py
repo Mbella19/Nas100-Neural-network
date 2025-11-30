@@ -662,16 +662,22 @@ def train_analyst(
         lookback_4h=config.lookback_4h if hasattr(config, 'lookback_4h') else 12
     )
 
-    # Split into train/validation
+    # Split into train/validation using CHRONOLOGICAL split (NOT random!)
+    # CRITICAL: Random splits cause look-ahead bias in time series data.
+    # The model would train on "Tuesday" and test on "Monday", memorizing the future.
     train_size = int(0.85 * len(dataset))
     val_size = len(dataset) - train_size
 
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset, [train_size, val_size],
-        generator=torch.Generator().manual_seed(42)
-    )
+    # Use Subset with sequential indices for chronological split
+    train_indices = list(range(0, train_size))
+    val_indices = list(range(train_size, len(dataset)))
 
-    logger.info(f"Train size: {train_size}, Val size: {val_size}")
+    train_dataset = torch.utils.data.Subset(dataset, train_indices)
+    val_dataset = torch.utils.data.Subset(dataset, val_indices)
+
+    logger.info(f"Train size: {train_size} (indices 0-{train_size-1})")
+    logger.info(f"Val size: {val_size} (indices {train_size}-{len(dataset)-1})")
+    logger.info("Using CHRONOLOGICAL split (train on past, validate on future)")
 
     # Create data loaders
     batch_size = config.batch_size if hasattr(config, 'batch_size') else 32
