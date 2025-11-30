@@ -1,0 +1,28 @@
+# Hybrid EURUSD Trading System Dependencies
+# Optimized for Apple M2 Silicon (8GB RAM)
+
+# Core Deep Learning
+torch>=2.0.0
+
+# Reinforcement Learning
+gymnasium>=0.29.0
+stable-baselines3>=2.1.0
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Technical Analysis
+pandas-ta>=0.3.14b
+
+# Machine Learning Utilities
+scikit-learn>=1.3.0
+
+# Visualization
+matplotlib>=3.7.0
+
+# Progress Bars
+tqdm>=4.65.0
+
+# Optional: For faster technical indicators (requires system installation)
+# TA-Lib>=0.4.28
