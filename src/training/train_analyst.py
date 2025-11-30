@@ -137,72 +137,82 @@ class MultiTimeframeDataset(Dataset):
         )
 
 
-class CorrelationAwareLoss(nn.Module):
+class DiversityAwareLoss(nn.Module):
     """
-    Loss function that prevents mode collapse using correlation.
+    Loss function that prevents mode collapse using PAIRWISE DIVERSITY.
     
-    The key insight: if the model outputs constants (mode collapse),
-    the correlation term becomes undefined/unstable, naturally pushing
-    the model toward diverse, meaningful predictions.
+    KEY INSIGHT: Variance penalty has ZERO GRADIENT when predictions are constant!
+    d(Var)/d(pred_i) = 2*(pred_i - mean)/n = 0 when all pred_i = mean
     
-    Loss = mse_weight * MSE + corr_weight * (1 - correlation) + var_weight * var_penalty
+    This loss uses a CONTRASTIVE approach that has non-zero gradient even when
+    predictions are identical, by operating on prediction DIFFERENCES:
     
-    The variance penalty directly penalizes low prediction variance,
-    making it impossible to collapse to constant outputs.
+    For pairs of samples where targets differ, predictions MUST also differ.
+    
+    Loss = mse_weight * MSE + diversity_weight * diversity_loss
+    
+    diversity_loss = mean(|target_diff| / (|pred_diff| + epsilon))
+    
+    When predictions are constant:
+    - pred_diff = 0 for all pairs
+    - diversity_loss = mean(|target_diff| / epsilon) → large
+    - Gradient flows through the numerator AND denominator
     """
     
-    def __init__(self, mse_weight: float = 1.0, corr_weight: float = 2.0, var_weight: float = 5.0):
+    def __init__(self, mse_weight: float = 1.0, diversity_weight: float = 0.1):
         """
         Args:
-            mse_weight: Weight for MSE loss
-            corr_weight: Weight for correlation loss (1 - pearson_r)
-            var_weight: Weight for variance penalty (penalizes low variance)
+            mse_weight: Weight for MSE loss (main learning signal)
+            diversity_weight: Weight for pairwise diversity loss (anti-collapse)
         """
         super().__init__()
         self.mse_weight = mse_weight
-        self.corr_weight = corr_weight
-        self.var_weight = var_weight
+        self.diversity_weight = diversity_weight
         
     def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         predictions = predictions.squeeze()
         targets = targets.squeeze()
         
-        # 1. MSE loss for magnitude accuracy
+        # 1. MSE loss for magnitude accuracy - THE MAIN LEARNING SIGNAL
         mse_loss = nn.functional.mse_loss(predictions, targets)
         
-        # 2. Correlation loss: maximize Pearson correlation
-        # This naturally requires prediction variance > 0
-        pred_centered = predictions - predictions.mean()
-        target_centered = targets - targets.mean()
+        # 2. Pairwise diversity loss - PREVENTS MODE COLLAPSE
+        # Sample pairs to avoid O(n^2) memory for large batches
+        batch_size = predictions.size(0)
+        n_pairs = min(batch_size * 4, batch_size * (batch_size - 1) // 2)  # sample pairs
         
-        pred_std = pred_centered.std() + 1e-8
-        target_std = target_centered.std() + 1e-8
-        
-        # Pearson correlation
-        correlation = (pred_centered * target_centered).mean() / (pred_std * target_std)
-        correlation = torch.clamp(correlation, -1.0, 1.0)  # numerical stability
-        
-        # Correlation loss: 1 - r (0 when perfect, 2 when perfectly anticorrelated)
-        corr_loss = 1.0 - correlation
-        
-        # 3. Variance penalty: DIRECTLY penalize low prediction variance
-        # This is the kill switch for mode collapse
-        # Target variance is ~0.0077 (std ~0.088), so we want pred_var > 0.001 at minimum
-        target_var = targets.var() + 1e-8
-        pred_var = predictions.var() + 1e-8
-        
-        # Penalize when pred_var < target_var using ratio
-        # If pred_var = target_var, penalty = 0
-        # If pred_var << target_var, penalty >> 0
-        var_ratio = target_var / pred_var  # large when pred_var is small
-        var_penalty = torch.relu(var_ratio - 1.0)  # only penalize when pred_var < target_var
+        if batch_size > 1 and n_pairs > 0:
+            # Generate random pair indices
+            idx1 = torch.randint(0, batch_size, (n_pairs,), device=predictions.device)
+            idx2 = torch.randint(0, batch_size, (n_pairs,), device=predictions.device)
+            
+            # Ensure pairs are different
+            mask = idx1 != idx2
+            idx1 = idx1[mask]
+            idx2 = idx2[mask]
+            
+            if idx1.size(0) > 0:
+                # Compute pairwise differences
+                target_diffs = (targets[idx1] - targets[idx2]).abs()  # [n_pairs]
+                pred_diffs = (predictions[idx1] - predictions[idx2]).abs()  # [n_pairs]
+                
+                # Diversity loss: when targets differ, predictions should differ
+                # Loss = |target_diff| / (|pred_diff| + epsilon)
+                # When pred_diff=0 and target_diff>0, loss is high
+                # Gradient: d(loss)/d(pred_diff) = -|target_diff| / (|pred_diff| + eps)^2
+                # This gradient is NON-ZERO even when pred_diff = 0!
+                epsilon = 0.01  # larger epsilon for stability
+                diversity_loss = (target_diffs / (pred_diffs + epsilon)).mean()
+                
+                # Clamp to prevent explosion
+                diversity_loss = torch.clamp(diversity_loss, 0, 100)
+            else:
+                diversity_loss = torch.tensor(0.0, device=predictions.device)
+        else:
+            diversity_loss = torch.tensor(0.0, device=predictions.device)
         
         # Combined loss
-        total_loss = (
-            self.mse_weight * mse_loss + 
-            self.corr_weight * corr_loss + 
-            self.var_weight * var_penalty
-        )
+        total_loss = self.mse_weight * mse_loss + self.diversity_weight * diversity_loss
         
         return total_loss
 
@@ -282,10 +292,10 @@ class AnalystTrainer:
             patience=5
         )
 
-        # Loss function: CorrelationAwareLoss = MSE + Correlation + Variance penalty
-        # The variance penalty DIRECTLY prevents mode collapse by penalizing low pred variance
-        # Correlation loss encourages matching target patterns, not just mean
-        self.criterion = CorrelationAwareLoss(mse_weight=1.0, corr_weight=2.0, var_weight=5.0)
+        # Loss function: DiversityAwareLoss = MSE + Pairwise Diversity
+        # KEY FIX: Variance penalty has ZERO gradient at collapse!
+        # Diversity loss uses pairwise differences which ALWAYS have gradient
+        self.criterion = DiversityAwareLoss(mse_weight=1.0, diversity_weight=0.1)
 
         # Training history
         self.train_losses = []
