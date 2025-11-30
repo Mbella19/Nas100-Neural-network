@@ -323,6 +323,18 @@ def step_6_backtest(
 
     # Use last 15% for testing
     test_start = int(0.85 * len(close_prices))
+    
+    # CRITICAL FIX: Compute market feature normalization stats from TRAINING data only
+    # This prevents look-ahead bias in the test backtest
+    train_market_features = market_features[:test_start]
+    market_feat_mean = train_market_features.mean(axis=0).astype(np.float32)
+    market_feat_std = train_market_features.std(axis=0).astype(np.float32)
+    market_feat_std = np.where(market_feat_std > 1e-8, market_feat_std, 1.0).astype(np.float32)
+    
+    logger.info("Using TRAINING data statistics for test environment normalization")
+    logger.info(f"  Market feature mean: {market_feat_mean}")
+    logger.info(f"  Market feature std:  {market_feat_std}")
+    
     test_data = (
         data_15m[test_start:],
         data_1h[test_start:],
@@ -331,12 +343,14 @@ def step_6_backtest(
         market_features[test_start:]
     )
 
-    # Create test environment
+    # Create test environment with TRAINING stats (prevents look-ahead bias)
     test_env = create_trading_env(
         *test_data,
         analyst_model=analyst,
         config=config.trading,
-        device=device
+        device=device,
+        market_feat_mean=market_feat_mean,
+        market_feat_std=market_feat_std
     )
 
     # Load agent

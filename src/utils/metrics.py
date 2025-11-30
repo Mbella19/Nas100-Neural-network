@@ -254,11 +254,15 @@ def calculate_trading_metrics(
         sharpe_ratio = float(np.mean(excess_returns) / np.std(excess_returns) * np.sqrt(periods_per_year))
 
     # Sortino ratio (downside deviation)
-    downside_returns = returns[returns < 0]
-    downside_std = np.std(downside_returns) if len(downside_returns) > 0 else 0.0
+    # FIXED: Use correct formula - RMS of min(returns, 0), not std of negative returns only
+    # This matches the formula in evaluation/metrics.py for consistency
+    downside_returns = np.minimum(excess_returns, 0)  # Set positive returns to 0
+    downside_std = np.sqrt(np.mean(downside_returns ** 2))  # RMS (root mean square)
     sortino_ratio = 0.0
-    if downside_std > 0:
+    if downside_std > 1e-10:
         sortino_ratio = float(np.mean(excess_returns) / downside_std * np.sqrt(periods_per_year))
+        # Cap to prevent inf in logs
+        sortino_ratio = min(sortino_ratio, 100.0)
 
     # Max drawdown
     cumulative = np.cumsum(returns)
