@@ -199,27 +199,32 @@ class RankingMSELoss(nn.Module):
                 margin_violations = -signs * pred_diff / temp
                 ranking_loss = torch.nn.functional.softplus(margin_violations).mean()
         
-        # 3. SIGN LOSS (Fixed: Differentiable)
-        # Use sigmoid to approximate step function (pred > 0)
-        # High gain (100) makes it sharp but differentiable
-        pred_soft_sign = torch.sigmoid(predictions * 100.0)
+        # 3. SIGN LOSS (Fixed: Prevent saturation)
+        # Use sigmoid to approximate step function
+        # Scale=10.0 keeps 0.1 in linear range of sigmoid
+        # Scale=100.0 saturated gradients for preds > 0.05
+        pred_soft_sign = torch.sigmoid(predictions * 10.0)
         pred_pos_frac = pred_soft_sign.mean()
         target_pos_frac = (targets > 0).float().mean()
-        
-        # Force fraction of positive predictions to match target fraction
         sign_loss = (pred_pos_frac - target_pos_frac) ** 2
         
         # 4. VARIANCE LOSS - Force scale matching
-        pred_std = predictions.std()
-        target_std = targets.std().detach()
+        pred_std = predictions.std() + 1e-6
+        target_std = targets.std().detach() + 1e-6
         variance_loss = (pred_std - target_std) ** 2
+
+        # 5. MEAN LOSS - Force centering (Anti-bias)
+        pred_mean = predictions.mean()
+        target_mean = targets.mean().detach()
+        mean_loss = (pred_mean - target_mean) ** 2
         
         # Combined loss
-        # ranking_weight=1.0, sign_weight=1.0, var_weight=1.0
+        # heavily weight auxiliary losses to break collapse
         total_loss = mse_loss + \
                      self.ranking_weight * ranking_loss + \
-                     1.0 * sign_loss + \
-                     1.0 * variance_loss
+                     10.0 * sign_loss + \
+                     10.0 * variance_loss + \
+                     10.0 * mean_loss
         
         return total_loss
 
@@ -300,9 +305,9 @@ class AnalystTrainer:
         )
 
         # Loss function: RankingMSELoss - FORCED VARIANCE + RANKING
-        # FIX 1: Soft Sign Loss (Differentiable) fixes 100% positive collapse
+        # FIX 1: Soft Sign Loss (Differentiable, non-saturating)
         # FIX 2: Variance Loss ((pred_std - target_std)^2) forces scale
-        # FIX 3: Ranking loss ensures correct relative ordering
+        # FIX 3: Mean Loss forces centering (breaks positive bias)
         self.criterion = RankingMSELoss(ranking_weight=1.0)
 
         # Training history
