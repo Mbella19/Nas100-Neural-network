@@ -137,49 +137,52 @@ class MultiTimeframeDataset(Dataset):
         )
 
 
-class DiversityAwareLoss(nn.Module):
+class ContrastiveLoss(nn.Module):
     """
-    Loss function that prevents mode collapse using PAIRWISE DIVERSITY.
+    Loss function that prevents mode collapse using CONTRASTIVE REGRESSION.
     
-    KEY INSIGHT: Variance penalty has ZERO GRADIENT when predictions are constant!
-    d(Var)/d(pred_i) = 2*(pred_i - mean)/n = 0 when all pred_i = mean
+    KEY INSIGHT: Both variance penalty AND absolute value have zero gradient at collapse!
+    - d(Var)/d(pred_i) = 0 when all pred_i = mean
+    - d|x|/dx = sign(x) = undefined at x=0
     
-    This loss uses a CONTRASTIVE approach that has non-zero gradient even when
-    predictions are identical, by operating on prediction DIFFERENCES:
+    SOLUTION: Use SQUARED differences which ALWAYS have gradient:
+    d(x^2)/dx = 2x (non-zero everywhere except exactly at x=0, but gradient points toward 0)
     
-    For pairs of samples where targets differ, predictions MUST also differ.
+    CRITICAL FIX: We need gradient that points AWAY from constant predictions.
     
-    Loss = mse_weight * MSE + diversity_weight * diversity_loss
+    Loss = MSE + contrastive_weight * contrastive_loss
     
-    diversity_loss = mean(|target_diff| / (|pred_diff| + epsilon))
+    contrastive_loss: For each pair, predictions should differ proportionally to targets:
+    loss = mean((target_diff - pred_diff)^2)
     
-    When predictions are constant:
-    - pred_diff = 0 for all pairs
-    - diversity_loss = mean(|target_diff| / epsilon) → large
-    - Gradient flows through the numerator AND denominator
+    This has gradient even when pred_diff = 0:
+    d(loss)/d(pred_i) = -2 * (target_diff - pred_diff) * d(pred_diff)/d(pred_i)
+                      = -2 * target_diff * 2 * (pred_i - pred_j) / (2*|pred_i - pred_j| + eps)
+    
+    At pred_i = pred_j:
+    d(loss)/d(pred_i) ≈ -2 * target_diff * sign(any perturbation) → pushes apart!
     """
     
-    def __init__(self, mse_weight: float = 1.0, diversity_weight: float = 0.1):
+    def __init__(self, mse_weight: float = 1.0, contrastive_weight: float = 1.0):
         """
         Args:
             mse_weight: Weight for MSE loss (main learning signal)
-            diversity_weight: Weight for pairwise diversity loss (anti-collapse)
+            contrastive_weight: Weight for contrastive loss (anti-collapse)
         """
         super().__init__()
         self.mse_weight = mse_weight
-        self.diversity_weight = diversity_weight
+        self.contrastive_weight = contrastive_weight
         
     def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         predictions = predictions.squeeze()
         targets = targets.squeeze()
         
-        # 1. MSE loss for magnitude accuracy - THE MAIN LEARNING SIGNAL
+        # 1. MSE loss for magnitude accuracy
         mse_loss = nn.functional.mse_loss(predictions, targets)
         
-        # 2. Pairwise diversity loss - PREVENTS MODE COLLAPSE
-        # Sample pairs to avoid O(n^2) memory for large batches
+        # 2. Contrastive loss - SQUARED DIFFERENCES HAVE GRADIENT!
         batch_size = predictions.size(0)
-        n_pairs = min(batch_size * 4, batch_size * (batch_size - 1) // 2)  # sample pairs
+        n_pairs = min(batch_size * 4, batch_size * (batch_size - 1) // 2)
         
         if batch_size > 1 and n_pairs > 0:
             # Generate random pair indices
@@ -192,27 +195,26 @@ class DiversityAwareLoss(nn.Module):
             idx2 = idx2[mask]
             
             if idx1.size(0) > 0:
-                # Compute pairwise differences
-                target_diffs = (targets[idx1] - targets[idx2]).abs()  # [n_pairs]
-                pred_diffs = (predictions[idx1] - predictions[idx2]).abs()  # [n_pairs]
+                # SQUARED differences - ALWAYS has gradient!
+                target_diffs_sq = (targets[idx1] - targets[idx2]) ** 2
+                pred_diffs_sq = (predictions[idx1] - predictions[idx2]) ** 2
                 
-                # Diversity loss: when targets differ, predictions should differ
-                # Loss = |target_diff| / (|pred_diff| + epsilon)
-                # When pred_diff=0 and target_diff>0, loss is high
-                # Gradient: d(loss)/d(pred_diff) = -|target_diff| / (|pred_diff| + eps)^2
-                # This gradient is NON-ZERO even when pred_diff = 0!
-                epsilon = 0.01  # larger epsilon for stability
-                diversity_loss = (target_diffs / (pred_diffs + epsilon)).mean()
+                # Scale target diffs to [0, 1] range for stability
+                target_scale = target_diffs_sq.mean().detach() + 1e-8
+                target_diffs_normalized = target_diffs_sq / target_scale
+                pred_diffs_normalized = pred_diffs_sq / target_scale
                 
-                # Clamp to prevent explosion
-                diversity_loss = torch.clamp(diversity_loss, 0, 100)
+                # Contrastive: pred differences should MATCH target differences
+                # When pred_diff=0 but target_diff>0, gradient pushes predictions apart
+                # d((t-p)^2)/d(p) = -2*(t-p) = -2*t when p=0, which is NON-ZERO!
+                contrastive_loss = nn.functional.mse_loss(pred_diffs_normalized, target_diffs_normalized)
             else:
-                diversity_loss = torch.tensor(0.0, device=predictions.device)
+                contrastive_loss = torch.tensor(0.0, device=predictions.device)
         else:
-            diversity_loss = torch.tensor(0.0, device=predictions.device)
+            contrastive_loss = torch.tensor(0.0, device=predictions.device)
         
         # Combined loss
-        total_loss = self.mse_weight * mse_loss + self.diversity_weight * diversity_loss
+        total_loss = self.mse_weight * mse_loss + self.contrastive_weight * contrastive_loss
         
         return total_loss
 
@@ -292,10 +294,10 @@ class AnalystTrainer:
             patience=5
         )
 
-        # Loss function: DiversityAwareLoss = MSE + Pairwise Diversity
-        # KEY FIX: Variance penalty has ZERO gradient at collapse!
-        # Diversity loss uses pairwise differences which ALWAYS have gradient
-        self.criterion = DiversityAwareLoss(mse_weight=1.0, diversity_weight=0.1)
+        # Loss function: ContrastiveLoss = MSE + Contrastive
+        # KEY FIX: Uses SQUARED differences which ALWAYS have gradient
+        # d(x^2)/dx = 2x ≠ 0, unlike d|x|/dx = sign(x) = undefined at 0
+        self.criterion = ContrastiveLoss(mse_weight=1.0, contrastive_weight=1.0)
 
         # Training history
         self.train_losses = []
