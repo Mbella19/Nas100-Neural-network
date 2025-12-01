@@ -39,7 +39,7 @@ class PathConfig:
 
     # Training data directory (external location)
     training_data_dir: Path = field(
-        default_factory=lambda: Path("/Users/gervaciusjr/Desktop/AI Trading Bot/Training data")
+        default_factory=lambda: Path("/Users/gervaciusjr/Desktop/Market data/Data")
     )
 
     @property
