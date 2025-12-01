@@ -925,11 +925,11 @@ class AnalystTrainer:
             'down_classes': self.down_classes,
             'class_names': self.class_names,
         }
-    }
+        }
 
-    filename = 'best.pt' if is_best else f'epoch_{epoch}.pt'
-    torch.save(checkpoint, path / filename)
-    logger.info(f"Saved checkpoint to {path / filename}")
+        filename = 'best.pt' if is_best else f'epoch_{epoch}.pt'
+        torch.save(checkpoint, path / filename)
+        logger.info(f"Saved checkpoint to {path / filename}")
 
 
 def train_analyst(
