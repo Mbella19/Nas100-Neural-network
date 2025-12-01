@@ -80,6 +80,42 @@ class TradingMetrics:
         }
 
 
+@dataclass
+class ClassificationMetrics:
+    """Classification metrics for discrete return buckets."""
+    accuracy: float
+    macro_precision: float
+    macro_recall: float
+    macro_f1: float
+    per_class_precision: List[float]
+    per_class_recall: List[float]
+    per_class_f1: List[float]
+    support: List[int]
+    confusion: np.ndarray
+    direction_accuracy: float
+    up_precision: float
+    up_recall: float
+    down_precision: float
+    down_recall: float
+    neutral_precision: float
+    neutral_recall: float
+
+    def to_dict(self) -> Dict[str, float]:
+        return {
+            'accuracy': self.accuracy,
+            'macro_precision': self.macro_precision,
+            'macro_recall': self.macro_recall,
+            'macro_f1': self.macro_f1,
+            'direction_accuracy': self.direction_accuracy,
+            'up_precision': self.up_precision,
+            'up_recall': self.up_recall,
+            'down_precision': self.down_precision,
+            'down_recall': self.down_recall,
+            'neutral_precision': self.neutral_precision,
+            'neutral_recall': self.neutral_recall
+        }
+
+
 def calculate_direction_accuracy(
     predictions: np.ndarray,
     targets: np.ndarray,
@@ -216,6 +252,119 @@ def calculate_regression_metrics(
     )
 
 
+def _classes_to_direction(
+    labels: np.ndarray,
+    up_classes: Tuple[int, ...],
+    down_classes: Tuple[int, ...]
+) -> np.ndarray:
+    """Map discrete classes to directional labels (-1, 0, 1)."""
+    direction = np.zeros_like(labels, dtype=int)
+    direction[np.isin(labels, up_classes)] = 1
+    direction[np.isin(labels, down_classes)] = -1
+    return direction
+
+
+def calculate_classification_metrics(
+    predictions: np.ndarray,
+    targets: np.ndarray,
+    num_classes: int,
+    up_classes: Tuple[int, ...] = (3, 4),
+    down_classes: Tuple[int, ...] = (0, 1)
+) -> ClassificationMetrics:
+    """
+    Compute detailed metrics for multi-class directional classification.
+
+    Args:
+        predictions: Predicted class indices or logits/probabilities
+        targets: True class indices
+        num_classes: Number of classes
+        up_classes: Class indices representing upward moves
+        down_classes: Class indices representing downward moves
+    """
+    if isinstance(predictions, torch.Tensor):
+        predictions = predictions.detach().cpu().numpy()
+    if isinstance(targets, torch.Tensor):
+        targets = targets.detach().cpu().numpy()
+
+    # Convert logits/probabilities to class indices if needed
+    if predictions.ndim > 1:
+        predictions = predictions.argmax(axis=1)
+
+    predictions = predictions.astype(int).flatten()
+    targets = targets.astype(int).flatten()
+
+    # Filter out invalid targets (NaN encoded as -2147483648 when cast to int)
+    valid_mask = (targets >= 0) & (targets < num_classes)
+    predictions = predictions[valid_mask]
+    targets = targets[valid_mask]
+
+    confusion = np.zeros((num_classes, num_classes), dtype=int)
+    for pred, tgt in zip(predictions, targets):
+        if 0 <= pred < num_classes:
+            confusion[tgt, pred] += 1
+
+    support = confusion.sum(axis=1)
+    total = support.sum()
+
+    accuracy = float((predictions == targets).mean()) if len(predictions) > 0 else 0.0
+
+    per_class_precision = []
+    per_class_recall = []
+    per_class_f1 = []
+
+    for cls in range(num_classes):
+        tp = confusion[cls, cls]
+        fp = confusion[:, cls].sum() - tp
+        fn = confusion[cls, :].sum() - tp
+
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+        per_class_precision.append(float(precision))
+        per_class_recall.append(float(recall))
+        per_class_f1.append(float(f1))
+
+    macro_precision = float(np.mean(per_class_precision)) if per_class_precision else 0.0
+    macro_recall = float(np.mean(per_class_recall)) if per_class_recall else 0.0
+    macro_f1 = float(np.mean(per_class_f1)) if per_class_f1 else 0.0
+
+    # Directional metrics (Up / Down / Neutral)
+    pred_dir = _classes_to_direction(predictions, up_classes, down_classes)
+    tgt_dir = _classes_to_direction(targets, up_classes, down_classes)
+
+    direction_accuracy = float((pred_dir == tgt_dir).mean()) if len(pred_dir) > 0 else 0.0
+
+    def _precision_recall(pred_mask: np.ndarray, tgt_mask: np.ndarray) -> Tuple[float, float]:
+        tp = (pred_mask & tgt_mask).sum()
+        precision = tp / pred_mask.sum() if pred_mask.sum() > 0 else 0.0
+        recall = tp / tgt_mask.sum() if tgt_mask.sum() > 0 else 0.0
+        return float(precision), float(recall)
+
+    up_precision, up_recall = _precision_recall(pred_dir == 1, tgt_dir == 1)
+    down_precision, down_recall = _precision_recall(pred_dir == -1, tgt_dir == -1)
+    neutral_precision, neutral_recall = _precision_recall(pred_dir == 0, tgt_dir == 0)
+
+    return ClassificationMetrics(
+        accuracy=accuracy,
+        macro_precision=macro_precision,
+        macro_recall=macro_recall,
+        macro_f1=macro_f1,
+        per_class_precision=per_class_precision,
+        per_class_recall=per_class_recall,
+        per_class_f1=per_class_f1,
+        support=support.tolist(),
+        confusion=confusion,
+        direction_accuracy=direction_accuracy,
+        up_precision=up_precision,
+        up_recall=up_recall,
+        down_precision=down_precision,
+        down_recall=down_recall,
+        neutral_precision=neutral_precision,
+        neutral_recall=neutral_recall
+    )
+
+
 def calculate_trading_metrics(
     returns: np.ndarray,
     risk_free_rate: float = 0.0,
@@ -308,10 +457,20 @@ class MetricsTracker:
         metrics = tracker.compute()
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        task_type: str = "regression",
+        num_classes: Optional[int] = None,
+        up_classes: Tuple[int, ...] = (3, 4),
+        down_classes: Tuple[int, ...] = (0, 1)
+    ):
         self.predictions: List[np.ndarray] = []
         self.targets: List[np.ndarray] = []
         self.losses: List[float] = []
+        self.task_type = task_type
+        self.num_classes = num_classes
+        self.up_classes = up_classes
+        self.down_classes = down_classes
 
     def reset(self):
         """Reset all accumulated values."""
@@ -331,8 +490,16 @@ class MetricsTracker:
         if isinstance(targets, torch.Tensor):
             targets = targets.detach().cpu().numpy()
 
-        self.predictions.append(predictions.flatten())
-        self.targets.append(targets.flatten())
+        if self.task_type == "classification":
+            # Accept logits/probabilities or class indices
+            if predictions.ndim > 1:
+                predictions = predictions.argmax(axis=1)
+            self.predictions.append(predictions.astype(int).flatten())
+            self.targets.append(targets.astype(int).flatten())
+        else:
+            self.predictions.append(predictions.flatten())
+            self.targets.append(targets.flatten())
+
         if loss is not None:
             self.losses.append(loss)
 
@@ -344,23 +511,47 @@ class MetricsTracker:
         all_predictions = np.concatenate(self.predictions)
         all_targets = np.concatenate(self.targets)
 
-        # Direction accuracy
-        dir_metrics = calculate_direction_accuracy(all_predictions, all_targets)
+        if self.task_type == "classification":
+            if self.num_classes is None:
+                raise ValueError("num_classes must be provided for classification metrics.")
 
-        # Regression metrics
-        reg_metrics = calculate_regression_metrics(all_predictions, all_targets)
+            class_metrics = calculate_classification_metrics(
+                all_predictions,
+                all_targets,
+                num_classes=self.num_classes,
+                up_classes=self.up_classes,
+                down_classes=self.down_classes
+            )
 
-        result = {
-            'direction_accuracy': dir_metrics.accuracy,
-            'up_precision': dir_metrics.up_precision,
-            'up_recall': dir_metrics.up_recall,
-            'down_precision': dir_metrics.down_precision,
-            'down_recall': dir_metrics.down_recall,
-            'mse': reg_metrics.mse,
-            'rmse': reg_metrics.rmse,
-            'mae': reg_metrics.mae,
-            'r2': reg_metrics.r2
-        }
+            result = {
+                'accuracy': class_metrics.accuracy,
+                'macro_f1': class_metrics.macro_f1,
+                'direction_accuracy': class_metrics.direction_accuracy,
+                'up_precision': class_metrics.up_precision,
+                'up_recall': class_metrics.up_recall,
+                'down_precision': class_metrics.down_precision,
+                'down_recall': class_metrics.down_recall,
+                'neutral_precision': class_metrics.neutral_precision,
+                'neutral_recall': class_metrics.neutral_recall
+            }
+        else:
+            # Direction accuracy
+            dir_metrics = calculate_direction_accuracy(all_predictions, all_targets)
+
+            # Regression metrics
+            reg_metrics = calculate_regression_metrics(all_predictions, all_targets)
+
+            result = {
+                'direction_accuracy': dir_metrics.accuracy,
+                'up_precision': dir_metrics.up_precision,
+                'up_recall': dir_metrics.up_recall,
+                'down_precision': dir_metrics.down_precision,
+                'down_recall': dir_metrics.down_recall,
+                'mse': reg_metrics.mse,
+                'rmse': reg_metrics.rmse,
+                'mae': reg_metrics.mae,
+                'r2': reg_metrics.r2
+            }
 
         if len(self.losses) > 0:
             result['avg_loss'] = float(np.mean(self.losses))

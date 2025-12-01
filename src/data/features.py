@@ -10,7 +10,7 @@ Implements:
 
 import pandas as pd
 import numpy as np
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Dict
 import logging
 
 logger = logging.getLogger(__name__)
@@ -637,6 +637,62 @@ def create_smoothed_target(
     target = target * scale_factor
 
     return target.astype(np.float32)
+
+
+def create_return_classes(
+    target: pd.Series,
+    class_std_thresholds: Tuple[float, float, float, float] = (-0.5, -0.1, 0.1, 0.5)
+) -> Tuple[pd.Series, Dict[str, float]]:
+    """
+    Convert a continuous smoothed-return target into discrete classes.
+
+    Classes (5-class scheme):
+        0: Strong Down   (< -0.5 * std)
+        1: Weak Down     [-0.5 * std, -0.1 * std)
+        2: Neutral       [-0.1 * std, +0.1 * std]
+        3: Weak Up       (+0.1 * std, +0.5 * std]
+        4: Strong Up     (> +0.5 * std)
+
+    Args:
+        target: Smoothed return series (already scaled)
+        class_std_thresholds: Multipliers of target std that define boundaries
+
+    Returns:
+        Tuple of (class labels Series with NaNs preserved, metadata dict)
+    """
+    target_std = float(target.dropna().std())
+
+    boundaries = {
+        'strong_down': class_std_thresholds[0] * target_std,
+        'weak_down': class_std_thresholds[1] * target_std,
+        'weak_up': class_std_thresholds[2] * target_std,
+        'strong_up': class_std_thresholds[3] * target_std
+    }
+
+    def _assign_class(value: float) -> float:
+        if pd.isna(value):
+            return np.nan
+        if value < boundaries['strong_down']:
+            return 0
+        if value < boundaries['weak_down']:
+            return 1
+        if value <= boundaries['weak_up']:
+            return 2
+        if value <= boundaries['strong_up']:
+            return 3
+        return 4
+
+    labels = target.apply(_assign_class).astype(np.float32)
+
+    meta = {
+        'target_std': target_std,
+        'strong_down_threshold': boundaries['strong_down'],
+        'weak_down_threshold': boundaries['weak_down'],
+        'weak_up_threshold': boundaries['weak_up'],
+        'strong_up_threshold': boundaries['strong_up']
+    }
+
+    return labels, meta
 
 
 def get_feature_columns(include_ohlcv: bool = False) -> List[str]:

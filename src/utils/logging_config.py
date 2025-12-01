@@ -289,19 +289,32 @@ class TrainingLogger:
         self,
         predictions: np.ndarray,
         targets: np.ndarray,
-        sample_size: int = 10
+        sample_size: int = 10,
+        task_type: str = "regression",
+        class_names: Optional[List[str]] = None
     ):
         """Log sample predictions vs targets for debugging."""
         self.logger.info("  Sample Predictions vs Targets:")
         indices = np.random.choice(len(predictions), min(sample_size, len(predictions)), replace=False)
         for i, idx in enumerate(indices):
-            # Convert to float to handle numpy arrays
-            pred = float(predictions[idx].item() if hasattr(predictions[idx], 'item') else predictions[idx])
-            target = float(targets[idx].item() if hasattr(targets[idx], 'item') else targets[idx])
-            error = abs(pred - target)
-            direction_match = "✓" if (pred > 0) == (target > 0) else "✗"
-            self.logger.info(f"    [{i+1}] Pred: {pred:+.6f} | Target: {target:+.6f} | "
-                           f"Error: {error:.6f} | Dir: {direction_match}")
+            if task_type == "classification":
+                pred_cls = int(predictions[idx])
+                tgt_cls = int(targets[idx])
+                pred_name = class_names[pred_cls] if class_names and pred_cls < len(class_names) else str(pred_cls)
+                tgt_name = class_names[tgt_cls] if class_names and tgt_cls < len(class_names) else str(tgt_cls)
+                match = "✓" if pred_cls == tgt_cls else "✗"
+                self.logger.info(
+                    f"    [{i+1}] Pred: {pred_cls} ({pred_name}) | "
+                    f"Target: {tgt_cls} ({tgt_name}) | Match: {match}"
+                )
+            else:
+                # Convert to float to handle numpy arrays
+                pred = float(predictions[idx].item() if hasattr(predictions[idx], 'item') else predictions[idx])
+                target = float(targets[idx].item() if hasattr(targets[idx], 'item') else targets[idx])
+                error = abs(pred - target)
+                direction_match = "✓" if (pred > 0) == (target > 0) else "✗"
+                self.logger.info(f"    [{i+1}] Pred: {pred:+.6f} | Target: {target:+.6f} | "
+                               f"Error: {error:.6f} | Dir: {direction_match}")
 
     def log_gradient_stats(self, model: torch.nn.Module):
         """Log gradient statistics for debugging."""

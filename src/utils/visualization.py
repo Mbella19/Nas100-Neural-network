@@ -57,6 +57,30 @@ class TrainingVisualizer:
             'neutral': '#95A5A6'      # Gray
         }
 
+    @staticmethod
+    def _prepare_class_arrays(
+        predictions: np.ndarray,
+        targets: np.ndarray,
+        num_classes: Optional[int] = None
+    ) -> Tuple[np.ndarray, np.ndarray, int]:
+        """Convert predictions/targets to flat int arrays and infer num_classes."""
+        preds = predictions
+        tgts = targets
+
+        if isinstance(preds, np.ndarray) and preds.ndim > 1:
+            preds = preds.argmax(axis=1)
+
+        preds = np.asarray(preds).astype(int).flatten()
+        tgts = np.asarray(tgts).astype(int).flatten()
+
+        inferred_classes = num_classes
+        if inferred_classes is None:
+            max_pred = preds.max() if preds.size > 0 else 0
+            max_tgt = tgts.max() if tgts.size > 0 else 0
+            inferred_classes = int(max(max_pred, max_tgt)) + 1
+
+        return preds, tgts, inferred_classes
+
     def plot_training_curves(
         self,
         history: Dict[str, List[float]],
@@ -78,12 +102,13 @@ class TrainingVisualizer:
         has_loss = 'train_loss' in history and 'val_loss' in history
         has_acc = 'train_acc' in history and 'val_acc' in history
         has_dir_acc = 'train_direction_acc' in history and 'val_direction_acc' in history
+        has_f1 = 'train_macro_f1' in history and 'val_macro_f1' in history
         has_lr = 'learning_rate' in history
         has_grad = 'grad_norm' in history
         has_memory = 'memory_mb' in history
 
         # Calculate number of subplots needed
-        n_plots = sum([has_loss, has_acc, has_dir_acc, has_lr, has_grad, has_memory])
+        n_plots = sum([has_loss, has_acc, has_dir_acc, has_f1, has_lr, has_grad, has_memory])
         if n_plots == 0:
             n_plots = 1
 
@@ -131,6 +156,21 @@ class TrainingVisualizer:
             ax.set_xlabel('Epoch')
             ax.set_ylabel('Accuracy (%)')
             ax.set_title('Training and Validation Accuracy')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            ax.set_ylim([0, 100])
+            plot_idx += 1
+
+        # Macro F1 plot
+        if has_f1:
+            ax = axes[plot_idx]
+            ax.plot(epochs, [f * 100 for f in history['train_macro_f1']],
+                   label='Train Macro F1', color=self.colors['train'], linewidth=2)
+            ax.plot(epochs, [f * 100 for f in history['val_macro_f1']],
+                   label='Val Macro F1', color=self.colors['val'], linewidth=2)
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel('Macro F1 (%)')
+            ax.set_title('Macro F1 Score')
             ax.legend()
             ax.grid(True, alpha=0.3)
             ax.set_ylim([0, 100])
@@ -203,13 +243,87 @@ class TrainingVisualizer:
 
         return fig
 
+    def _plot_classification_comparison(
+        self,
+        predictions: np.ndarray,
+        targets: np.ndarray,
+        class_names: Optional[List[str]] = None,
+        title: str = "Classification Overview",
+        save_name: Optional[str] = None
+    ) -> plt.Figure:
+        """Confusion + distribution plot for classification targets."""
+        preds, tgts, num_classes = self._prepare_class_arrays(
+            predictions, targets
+        )
+
+        if class_names:
+            class_labels = list(class_names)
+            if len(class_labels) < num_classes:
+                class_labels += [f"Class {i}" for i in range(len(class_labels), num_classes)]
+        else:
+            class_labels = [f"Class {i}" for i in range(num_classes)]
+
+        confusion = np.zeros((num_classes, num_classes), dtype=int)
+        for pred, tgt in zip(preds, tgts):
+            if 0 <= pred < num_classes and 0 <= tgt < num_classes:
+                confusion[tgt, pred] += 1
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+        # Confusion matrix heatmap
+        ax = axes[0]
+        im = ax.imshow(confusion, cmap='Blues')
+        ax.set_xticks(range(num_classes))
+        ax.set_yticks(range(num_classes))
+        ax.set_xticklabels(class_labels, rotation=45, ha='right')
+        ax.set_yticklabels(class_labels)
+        ax.set_title('Confusion Matrix')
+
+        for i in range(num_classes):
+            for j in range(num_classes):
+                total = confusion.sum() if confusion.sum() > 0 else 1
+                pct = confusion[i, j] / total * 100
+                ax.text(j, i, f"{confusion[i, j]}\n({pct:.1f}%)",
+                        ha='center', va='center', fontsize=9)
+
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+        # Distribution comparison
+        ax = axes[1]
+        tgt_counts = np.bincount(tgts, minlength=num_classes)
+        pred_counts = np.bincount(preds, minlength=num_classes)
+        total_tgt = tgt_counts.sum() if tgt_counts.sum() > 0 else 1
+        total_pred = pred_counts.sum() if pred_counts.sum() > 0 else 1
+        x = np.arange(num_classes)
+
+        ax.bar(x - 0.15, tgt_counts / total_tgt * 100,
+               width=0.3, color=self.colors['train'], label='True')
+        ax.bar(x + 0.15, pred_counts / total_pred * 100,
+               width=0.3, color=self.colors['val'], label='Pred')
+        ax.set_xticks(x)
+        ax.set_xticklabels(class_labels, rotation=45, ha='right')
+        ax.set_ylabel('Share (%)')
+        ax.set_title('Class Distribution')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        plt.suptitle(title, fontsize=14, fontweight='bold')
+        plt.tight_layout()
+
+        if save_name and self.save_dir:
+            plt.savefig(self.save_dir / save_name, dpi=150, bbox_inches='tight')
+
+        return fig
+
     def plot_predictions_vs_targets(
         self,
         predictions: np.ndarray,
         targets: np.ndarray,
         title: str = "Predictions vs Targets",
         save_name: Optional[str] = None,
-        sample_size: int = 1000
+        sample_size: int = 1000,
+        task_type: str = "regression",
+        class_names: Optional[List[str]] = None
     ) -> plt.Figure:
         """
         Plot predictions against actual targets.
@@ -220,10 +334,21 @@ class TrainingVisualizer:
             title: Plot title
             save_name: Filename to save
             sample_size: Number of points to plot
+            task_type: "regression" or "classification"
+            class_names: Optional list of class names for classification
 
         Returns:
             matplotlib Figure
         """
+        if task_type == "classification":
+            return self._plot_classification_comparison(
+                predictions,
+                targets,
+                class_names=class_names,
+                title=title,
+                save_name=save_name
+            )
+
         predictions = predictions.flatten()
         targets = targets.flatten()
 
@@ -284,7 +409,10 @@ class TrainingVisualizer:
         predictions: np.ndarray,
         targets: np.ndarray,
         title: str = "Direction Classification",
-        save_name: Optional[str] = None
+        save_name: Optional[str] = None,
+        task_type: str = "regression",
+        up_classes: Tuple[int, ...] = (3, 4),
+        down_classes: Tuple[int, ...] = (0, 1)
     ) -> plt.Figure:
         """
         Plot direction confusion matrix.
@@ -294,10 +422,80 @@ class TrainingVisualizer:
             targets: Actual values
             title: Plot title
             save_name: Filename to save
+            task_type: "regression" or "classification"
+            up_classes: Classes mapped to "up" when task_type == "classification"
+            down_classes: Classes mapped to "down" when task_type == "classification"
 
         Returns:
             matplotlib Figure
         """
+        if task_type == "classification":
+            preds, tgts, _ = self._prepare_class_arrays(predictions, targets)
+            pred_dir = np.zeros_like(preds)
+            pred_dir[np.isin(preds, up_classes)] = 1
+            pred_dir[np.isin(preds, down_classes)] = -1
+
+            tgt_dir = np.zeros_like(tgts)
+            tgt_dir[np.isin(tgts, up_classes)] = 1
+            tgt_dir[np.isin(tgts, down_classes)] = -1
+
+            labels = [-1, 0, 1]
+            label_names = ['Down', 'Neutral', 'Up']
+            idx_map = {val: i for i, val in enumerate(labels)}
+
+            confusion = np.zeros((3, 3), dtype=int)
+            for p, t in zip(pred_dir, tgt_dir):
+                confusion[idx_map[t], idx_map[p]] += 1
+
+            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+            ax = axes[0]
+            im = ax.imshow(confusion, cmap='Blues')
+            ax.set_xticks(range(3))
+            ax.set_yticks(range(3))
+            ax.set_xticklabels(label_names)
+            ax.set_yticklabels(label_names)
+            ax.set_title('Directional Confusion')
+
+            for i in range(3):
+                for j in range(3):
+                    total = confusion.sum() if confusion.sum() > 0 else 1
+                    pct = confusion[i, j] / total * 100
+                    ax.text(j, i, f"{confusion[i, j]}\n({pct:.1f}%)",
+                            ha='center', va='center', fontsize=10)
+
+            plt.colorbar(im, ax=ax)
+
+            ax = axes[1]
+            total = confusion.sum() if confusion.sum() > 0 else 1
+            accuracy = np.trace(confusion) / total
+            recall = np.divide(
+                confusion.diagonal(),
+                confusion.sum(axis=1, keepdims=False) + 1e-8
+            )
+            metrics = ['Accuracy', 'Recall Down', 'Recall Neutral', 'Recall Up']
+            values = [accuracy, *recall.tolist()]
+            colors = [
+                self.colors['train'],
+                self.colors['negative'],
+                self.colors['neutral'],
+                self.colors['positive']
+            ]
+            bars = ax.bar(metrics, values, color=colors)
+            ax.set_ylim([0, 1])
+            ax.set_ylabel('Score')
+            ax.set_title('Directional Metrics')
+            for bar, val in zip(bars, values):
+                ax.text(bar.get_x() + bar.get_width()/2, val + 0.02,
+                        f"{val:.2f}", ha='center', va='bottom', fontsize=9)
+
+            plt.suptitle(title, fontsize=14, fontweight='bold')
+            plt.tight_layout()
+
+            if save_name and self.save_dir:
+                plt.savefig(self.save_dir / save_name, dpi=150, bbox_inches='tight')
+
+            return fig
+
         predictions = predictions.flatten()
         targets = targets.flatten()
 
@@ -380,7 +578,10 @@ class TrainingVisualizer:
         val_predictions: np.ndarray,
         val_targets: np.ndarray,
         metrics: Dict[str, float],
-        save_name: Optional[str] = None
+        save_name: Optional[str] = None,
+        task_type: str = "regression",
+        class_names: Optional[List[str]] = None,
+        num_classes: Optional[int] = None
     ) -> plt.Figure:
         """
         Create comprehensive epoch summary visualization.
@@ -397,6 +598,101 @@ class TrainingVisualizer:
         Returns:
             matplotlib Figure
         """
+        if task_type == "classification":
+            preds_train, tgts_train, n_classes = self._prepare_class_arrays(
+                train_predictions, train_targets, num_classes
+            )
+            preds_val, tgts_val, n_classes = self._prepare_class_arrays(
+                val_predictions, val_targets, n_classes
+            )
+
+            if class_names:
+                class_labels = list(class_names)
+                if len(class_labels) < n_classes:
+                    class_labels += [f"Class {i}" for i in range(len(class_labels), n_classes)]
+            else:
+                class_labels = [f"Class {i}" for i in range(n_classes)]
+
+            def _confusion_matrix(preds: np.ndarray, tgts: np.ndarray) -> np.ndarray:
+                conf = np.zeros((n_classes, n_classes), dtype=int)
+                for p, t in zip(preds, tgts):
+                    if 0 <= p < n_classes and 0 <= t < n_classes:
+                        conf[t, p] += 1
+                return conf
+
+            train_conf = _confusion_matrix(preds_train, tgts_train)
+            val_conf = _confusion_matrix(preds_val, tgts_val)
+
+            fig = plt.figure(figsize=(14, 10))
+            gs = gridspec.GridSpec(2, 2, figure=fig)
+
+            # Train confusion
+            ax1 = fig.add_subplot(gs[0, 0])
+            im1 = ax1.imshow(train_conf, cmap='Blues')
+            ax1.set_title('Train Confusion')
+            ax1.set_xticks(range(n_classes))
+            ax1.set_yticks(range(n_classes))
+            ax1.set_xticklabels(class_labels, rotation=45, ha='right')
+            ax1.set_yticklabels(class_labels)
+            for i in range(n_classes):
+                for j in range(n_classes):
+                    ax1.text(j, i, str(train_conf[i, j]), ha='center', va='center', fontsize=9)
+            fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+
+            # Val confusion
+            ax2 = fig.add_subplot(gs[0, 1])
+            im2 = ax2.imshow(val_conf, cmap='Blues')
+            ax2.set_title('Val Confusion')
+            ax2.set_xticks(range(n_classes))
+            ax2.set_yticks(range(n_classes))
+            ax2.set_xticklabels(class_labels, rotation=45, ha='right')
+            ax2.set_yticklabels(class_labels)
+            for i in range(n_classes):
+                for j in range(n_classes):
+                    ax2.text(j, i, str(val_conf[i, j]), ha='center', va='center', fontsize=9)
+            fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+
+            # Distribution comparison
+            ax3 = fig.add_subplot(gs[1, 0])
+            train_counts = np.bincount(tgts_train, minlength=n_classes)
+            val_counts = np.bincount(tgts_val, minlength=n_classes)
+            total_train = train_counts.sum() if train_counts.sum() > 0 else 1
+            total_val = val_counts.sum() if val_counts.sum() > 0 else 1
+            x = np.arange(n_classes)
+            ax3.bar(x - 0.15, train_counts / total_train * 100,
+                    width=0.3, color=self.colors['train'], label='Train')
+            ax3.bar(x + 0.15, val_counts / total_val * 100,
+                    width=0.3, color=self.colors['val'], label='Val')
+            ax3.set_xticks(x)
+            ax3.set_xticklabels(class_labels, rotation=45, ha='right')
+            ax3.set_ylabel('Share (%)')
+            ax3.set_title('Target Distribution')
+            ax3.legend()
+            ax3.grid(True, alpha=0.3)
+
+            # Metrics summary
+            ax4 = fig.add_subplot(gs[1, 1])
+            ax4.axis('off')
+            metrics_text = f"Epoch {epoch} Metrics\n" + "=" * 30 + "\n"
+            for key, value in metrics.items():
+                if isinstance(value, float):
+                    metrics_text += f"{key}: {value:.4f}\n"
+                else:
+                    metrics_text += f"{key}: {value}\n"
+            ax4.text(0.05, 0.95, metrics_text, transform=ax4.transAxes,
+                     fontsize=10, verticalalignment='top', fontfamily='monospace',
+                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            plt.suptitle(f'Epoch {epoch} Summary - {timestamp}',
+                         fontsize=14, fontweight='bold')
+            plt.tight_layout()
+
+            if save_name and self.save_dir:
+                plt.savefig(self.save_dir / save_name, dpi=150, bbox_inches='tight')
+
+            return fig
+
         fig = plt.figure(figsize=(16, 12))
         gs = gridspec.GridSpec(3, 3, figure=fig)
 

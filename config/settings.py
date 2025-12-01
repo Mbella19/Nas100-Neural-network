@@ -121,6 +121,8 @@ class AnalystConfig:
     # Target computation
     future_window: int = 12     # Candles ahead for smoothed return
     smooth_window: int = 12     # Rolling window for smoothing
+    num_classes: int = 5        # Number of discrete return classes
+    class_std_thresholds: Tuple[float, float, float, float] = (-0.5, -0.1, 0.1, 0.5)
 
 
 @dataclass

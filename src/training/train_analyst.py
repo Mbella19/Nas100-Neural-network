@@ -1,9 +1,9 @@
 """
 Training script for the Market Analyst (supervised learning).
 
-Trains the Analyst to predict smoothed future returns across
-multiple timeframes. After training, the model is frozen for
-use with the RL agent.
+Trains the Analyst to classify smoothed future returns across
+multiple timeframes (5-class directional buckets). After training,
+the model is frozen for use with the RL agent.
 
 Memory-optimized for Apple M2 Silicon.
 
@@ -27,14 +27,12 @@ import gc
 import time
 
 from ..models.analyst import MarketAnalyst, create_analyst
-from ..data.features import create_smoothed_target
-from ..utils.logging_config import TrainingLogger, setup_logging, get_logger
+from ..data.features import create_smoothed_target, create_return_classes
+from ..utils.logging_config import TrainingLogger, get_logger
 from ..utils.metrics import (
     MetricsTracker,
-    calculate_direction_accuracy,
-    calculate_regression_metrics,
-    compute_gradient_norm,
-    compute_prediction_stats
+    calculate_classification_metrics,
+    compute_gradient_norm
 )
 from ..utils.visualization import TrainingVisualizer
 
@@ -62,6 +60,7 @@ class MultiTimeframeDataset(Dataset):
         df_4h: pd.DataFrame,
         feature_cols: List[str],
         target: pd.Series,
+        class_labels: pd.Series,
         lookback_15m: int = 48,
         lookback_1h: int = 24,
         lookback_4h: int = 12
@@ -90,6 +89,7 @@ class MultiTimeframeDataset(Dataset):
         self.features_1h = df_1h[feature_cols].values.astype(np.float32)
         self.features_4h = df_4h[feature_cols].values.astype(np.float32)
         self.targets = target.values.astype(np.float32)
+        self.class_labels = class_labels.values.astype(np.float32)
 
         # FIXED: Calculate start index based on actual temporal coverage needed
         # For 1H lookback: need lookback_1h * 4 indices (since data is aligned to 15m)
@@ -99,7 +99,7 @@ class MultiTimeframeDataset(Dataset):
             lookback_1h * self.subsample_1h,
             lookback_4h * self.subsample_4h
         )
-        self.valid_mask = ~np.isnan(self.targets[self.start_idx:])
+        self.valid_mask = ~np.isnan(self.class_labels[self.start_idx:])
         self.valid_indices = np.where(self.valid_mask)[0] + self.start_idx
 
         logger.info(f"Dataset created with {len(self.valid_indices)} valid samples")
@@ -127,14 +127,110 @@ class MultiTimeframeDataset(Dataset):
         x_4h = self.features_4h[list(idx_range_4h)]
 
         # Target
-        y = self.targets[actual_idx]
+        y = self.class_labels[actual_idx]
 
         return (
             torch.tensor(x_15m, dtype=torch.float32),
             torch.tensor(x_1h, dtype=torch.float32),
             torch.tensor(x_4h, dtype=torch.float32),
-            torch.tensor([y], dtype=torch.float32)
+            torch.tensor(int(y), dtype=torch.long)
         )
+
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for multi-class classification.
+    
+    FL(p_t) = -α_t * (1 - p_t)^γ * log(p_t)
+    
+    Key properties:
+    - Down-weights easy examples (high p_t) where model is already confident
+    - Focuses learning on hard examples (low p_t) that the model struggles with
+    - Perfect for class collapse where model ignores minority classes
+    
+    In our case: The model predicts Strong Up (34.7%) instead of Weak Up (3.8%)
+    because Strong Up is "easier". Focal loss penalizes these easy examples
+    and forces attention to the hard Weak Up distinctions.
+    
+    Reference: "Focal Loss for Dense Object Detection" (Lin et al., 2017)
+    """
+    
+    def __init__(
+        self, 
+        weight: Optional[torch.Tensor] = None,
+        gamma: float = 2.0,
+        reduction: str = 'mean',
+        label_smoothing: float = 0.1
+    ):
+        """
+        Args:
+            weight: Class weights tensor [num_classes]
+            gamma: Focusing parameter. Higher = more focus on hard examples.
+                   γ=0 is equivalent to CrossEntropyLoss
+                   γ=2 is typical for object detection
+            reduction: 'none', 'mean', or 'sum'
+            label_smoothing: Prevents overconfidence, helps generalization
+        """
+        super().__init__()
+        self.weight = weight
+        self.gamma = gamma
+        self.reduction = reduction
+        self.label_smoothing = label_smoothing
+        
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            logits: Raw model outputs [batch, num_classes]
+            targets: Class labels [batch]
+        
+        Returns:
+            Focal loss value
+        """
+        num_classes = logits.size(-1)
+        
+        # Apply label smoothing
+        # Converts hard labels to soft: [0,0,1,0,0] -> [0.02, 0.02, 0.92, 0.02, 0.02]
+        if self.label_smoothing > 0:
+            with torch.no_grad():
+                smooth_targets = torch.zeros_like(logits)
+                smooth_targets.fill_(self.label_smoothing / (num_classes - 1))
+                smooth_targets.scatter_(1, targets.unsqueeze(1), 1.0 - self.label_smoothing)
+        
+        # Compute softmax probabilities
+        probs = torch.softmax(logits, dim=-1)
+        
+        # Get probability for true class: p_t
+        p_t = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+        
+        # Compute focal weight: (1 - p_t)^gamma
+        # When p_t is high (easy example), weight is low
+        # When p_t is low (hard example), weight is high
+        focal_weight = (1 - p_t) ** self.gamma
+        
+        # Compute cross-entropy (with or without label smoothing)
+        if self.label_smoothing > 0:
+            # Log softmax for numerical stability
+            log_probs = torch.log_softmax(logits, dim=-1)
+            ce_loss = -(smooth_targets * log_probs).sum(dim=-1)
+        else:
+            ce_loss = nn.functional.cross_entropy(
+                logits, targets, weight=self.weight, reduction='none'
+            )
+        
+        # Apply focal weight
+        focal_loss = focal_weight * ce_loss
+        
+        # Apply class weights if provided (for label smoothing path)
+        if self.weight is not None and self.label_smoothing > 0:
+            class_weight = self.weight[targets]
+            focal_loss = focal_loss * class_weight
+        
+        # Reduce
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        return focal_loss
 
 
 class RankingMSELoss(nn.Module):
@@ -219,6 +315,32 @@ class RankingMSELoss(nn.Module):
         return total_loss
 
 
+def compute_class_weights(
+    labels: np.ndarray,
+    num_classes: int,
+    device: torch.device
+) -> torch.Tensor:
+    """
+    Compute normalized class weights to counter class imbalance.
+    
+    Uses inverse frequency weighting normalized to mean=1.
+    """
+    counts = np.bincount(labels.astype(int), minlength=num_classes).astype(np.float32)
+    total = counts.sum()
+
+    if total == 0:
+        return torch.ones(num_classes, device=device, dtype=torch.float32)
+
+    # Standard inverse frequency weights
+    weights = np.where(counts > 0, total / (num_classes * counts), 0.0)
+    
+    # Normalize to mean=1
+    mean_weight = weights.mean() if weights.mean() > 0 else 1.0
+    weights = weights / mean_weight
+
+    return torch.tensor(weights, device=device, dtype=torch.float32)
+
+
 class AnalystTrainer:
     """
     Trainer class for the Market Analyst model.
@@ -242,7 +364,13 @@ class AnalystTrainer:
         patience: int = 10,
         cache_clear_interval: int = 50,
         log_dir: Optional[str] = None,
-        visualize: bool = True
+        visualize: bool = True,
+        num_classes: int = 5,
+        class_weights: Optional[torch.Tensor] = None,
+        up_classes: Tuple[int, ...] = (3, 4),
+        down_classes: Tuple[int, ...] = (0, 1),
+        class_names: Optional[List[str]] = None,
+        class_meta: Optional[Dict[str, float]] = None
     ):
         """
         Args:
@@ -254,6 +382,12 @@ class AnalystTrainer:
             cache_clear_interval: Clear MPS cache every N batches
             log_dir: Directory for logs and visualizations
             visualize: Whether to create visualizations
+            num_classes: Number of discrete return classes
+            class_weights: Optional class weighting tensor for CrossEntropy
+            up_classes: Classes considered bullish for direction metrics
+            down_classes: Classes considered bearish for direction metrics
+            class_names: Optional human-readable class names (len = num_classes)
+            class_meta: Optional metadata about class thresholds/std
         """
         self.model = model.to(device)
         self.device = device
@@ -261,6 +395,22 @@ class AnalystTrainer:
         self.cache_clear_interval = cache_clear_interval
         self.visualize = visualize
         self.log_dir = Path(log_dir) if log_dir else None
+        self.num_classes = num_classes
+        self.up_classes = up_classes
+        self.down_classes = down_classes
+        self.class_meta = class_meta or {}
+
+        default_class_names = [
+            "Strong Down",
+            "Weak Down",
+            "Neutral",
+            "Weak Up",
+            "Strong Up"
+        ]
+        self.class_names = class_names or default_class_names[:num_classes]
+        if len(self.class_names) < num_classes:
+            missing = [f"Class {i}" for i in range(len(self.class_names), num_classes)]
+            self.class_names = self.class_names + missing
 
         # Setup logging
         if self.log_dir:
@@ -294,11 +444,11 @@ class AnalystTrainer:
             patience=5
         )
 
-        # Loss function: RankingMSELoss - FORCED VARIANCE + RANKING
-        # FIX 1: Variance Loss ((pred_std - target_std)^2) forces scale
-        # FIX 2: Mean Loss forces centering (breaks positive/negative bias)
-        # FIX 3: Ranking loss ensures correct relative ordering
-        self.criterion = RankingMSELoss(ranking_weight=2.0)
+        if class_weights is not None:
+            class_weights = class_weights.to(device)
+
+        # Multi-class classification loss with class weights
+        self.criterion = nn.CrossEntropyLoss(weight=class_weights)
 
         # Training history
         self.train_losses = []
@@ -307,6 +457,8 @@ class AnalystTrainer:
         self.val_accs = []
         self.train_direction_accs = []
         self.val_direction_accs = []
+        self.train_macro_f1s = []
+        self.val_macro_f1s = []
         self.learning_rates = []
         self.grad_norms = []
         self.memory_usage = []
@@ -322,12 +474,12 @@ class AnalystTrainer:
         train_loader: DataLoader,
         epoch: int,
         total_epochs: int
-    ) -> Tuple[float, float, float]:
+    ) -> Tuple[float, float, float, float]:
         """
         Train for one epoch with detailed metrics.
 
         Returns:
-            Tuple of (avg_loss, accuracy, direction_accuracy)
+            Tuple of (avg_loss, accuracy, direction_accuracy, macro_f1)
         """
         self.model.train()
         self.criterion.train()  # Enable noise injection
@@ -335,7 +487,12 @@ class AnalystTrainer:
         n_batches = len(train_loader)
 
         # Metrics tracker for the epoch
-        metrics_tracker = MetricsTracker()
+        metrics_tracker = MetricsTracker(
+            task_type="classification",
+            num_classes=self.num_classes,
+            up_classes=self.up_classes,
+            down_classes=self.down_classes
+        )
 
         self.training_logger.start_epoch(epoch, total_epochs)
 
@@ -351,8 +508,8 @@ class AnalystTrainer:
 
             # Forward pass
             self.optimizer.zero_grad()
-            _, predictions = self.model(x_15m, x_1h, x_4h)
-            loss = self.criterion(predictions, targets)
+            _, logits = self.model(x_15m, x_1h, x_4h)
+            loss = self.criterion(logits, targets)
 
             # Backward pass
             loss.backward()
@@ -371,8 +528,9 @@ class AnalystTrainer:
             self.batch_losses.append(loss_val)
 
             # Store predictions for accuracy calculation
+            pred_classes = torch.argmax(logits, dim=1)
             metrics_tracker.update(
-                predictions.detach().cpu().numpy(),
+                pred_classes.detach().cpu().numpy(),
                 targets.detach().cpu().numpy(),
                 loss_val
             )
@@ -403,17 +561,17 @@ class AnalystTrainer:
             })
 
             # Clean up batch tensors
-            del x_15m, x_1h, x_4h, targets, predictions, loss
+            del x_15m, x_1h, x_4h, targets, logits, pred_classes, loss
 
         # Compute epoch metrics
         epoch_metrics = metrics_tracker.compute()
         avg_loss = total_loss / n_batches
         direction_acc = epoch_metrics.get('direction_accuracy', 0.0)
 
-        # For regression, we use R² as "accuracy"
-        accuracy = max(0, epoch_metrics.get('r2', 0.0))
+        accuracy = epoch_metrics.get('accuracy', 0.0)
+        macro_f1 = epoch_metrics.get('macro_f1', 0.0)
 
-        return avg_loss, accuracy, direction_acc
+        return avg_loss, accuracy, direction_acc, macro_f1
 
     @torch.no_grad()
     def validate(
@@ -427,13 +585,18 @@ class AnalystTrainer:
             Tuple of (avg_loss, accuracy, direction_accuracy, predictions, targets)
         """
         self.model.eval()
-        self.criterion.eval()  # Disable noise injection for validation
         total_loss = 0.0
         n_batches = 0
 
         # Collect all predictions and targets
         all_predictions = []
         all_targets = []
+        metrics_tracker = MetricsTracker(
+            task_type="classification",
+            num_classes=self.num_classes,
+            up_classes=self.up_classes,
+            down_classes=self.down_classes
+        )
 
         for x_15m, x_1h, x_4h, targets in val_loader:
             x_15m = x_15m.to(self.device)
@@ -441,29 +604,30 @@ class AnalystTrainer:
             x_4h = x_4h.to(self.device)
             targets = targets.to(self.device)
 
-            _, predictions = self.model(x_15m, x_1h, x_4h)
-            loss = self.criterion(predictions, targets)
+            _, logits = self.model(x_15m, x_1h, x_4h)
+            loss = self.criterion(logits, targets)
 
             total_loss += loss.item()
             n_batches += 1
 
-            all_predictions.append(predictions.cpu().numpy())
-            all_targets.append(targets.cpu().numpy())
+            pred_classes = torch.argmax(logits, dim=1)
 
-            del x_15m, x_1h, x_4h, targets, predictions
+            all_predictions.append(pred_classes.cpu().numpy())
+            all_targets.append(targets.cpu().numpy())
+            metrics_tracker.update(pred_classes.cpu().numpy(), targets.cpu().numpy(), loss.item())
+
+            del x_15m, x_1h, x_4h, targets, logits, pred_classes
 
         # Concatenate all predictions and targets
-        all_predictions = np.concatenate(all_predictions)
-        all_targets = np.concatenate(all_targets)
+        all_predictions = np.concatenate(all_predictions) if len(all_predictions) > 0 else np.array([])
+        all_targets = np.concatenate(all_targets) if len(all_targets) > 0 else np.array([])
 
         # Calculate metrics
-        avg_loss = total_loss / n_batches
-        reg_metrics = calculate_regression_metrics(all_predictions, all_targets)
-        dir_metrics = calculate_direction_accuracy(all_predictions, all_targets)
+        avg_loss = total_loss / max(n_batches, 1)
+        class_metrics = metrics_tracker.compute()
 
-        # R² as accuracy (clipped to 0 minimum)
-        accuracy = max(0, reg_metrics.r2)
-        direction_acc = dir_metrics.accuracy
+        accuracy = class_metrics.get('accuracy', 0.0)
+        direction_acc = class_metrics.get('direction_accuracy', 0.0)
 
         return avg_loss, accuracy, direction_acc, all_predictions, all_targets
 
@@ -495,18 +659,29 @@ class AnalystTrainer:
 
         for epoch in range(1, max_epochs + 1):
             # Train
-            train_loss, train_acc, train_dir_acc = self.train_epoch(
+            train_loss, train_acc, train_dir_acc, train_macro_f1 = self.train_epoch(
                 train_loader, epoch, max_epochs
             )
             self.train_losses.append(train_loss)
             self.train_accs.append(train_acc)
             self.train_direction_accs.append(train_dir_acc)
+            self.train_macro_f1s.append(train_macro_f1)
 
             # Validate
             val_loss, val_acc, val_dir_acc, val_preds, val_targets = self.validate(val_loader)
             self.val_losses.append(val_loss)
             self.val_accs.append(val_acc)
             self.val_direction_accs.append(val_dir_acc)
+
+            # Detailed validation metrics
+            class_metrics = calculate_classification_metrics(
+                val_preds,
+                val_targets,
+                num_classes=self.num_classes,
+                up_classes=self.up_classes,
+                down_classes=self.down_classes
+            )
+            self.val_macro_f1s.append(class_metrics.macro_f1)
 
             # Get current learning rate
             current_lr = self.optimizer.param_groups[0]['lr']
@@ -532,23 +707,33 @@ class AnalystTrainer:
                 lr=current_lr,
                 grad_norm=avg_grad_norm,
                 extra_metrics={
-                    'val_r2': val_acc,
-                    'val_dir_precision_up': calculate_direction_accuracy(val_preds, val_targets).up_precision,
-                    'val_dir_recall_up': calculate_direction_accuracy(val_preds, val_targets).up_recall
+                    'train_macro_f1': train_macro_f1,
+                    'val_macro_f1': class_metrics.macro_f1,
+                    'val_up_recall': class_metrics.up_recall,
+                    'val_down_recall': class_metrics.down_recall,
+                    'val_neutral_recall': class_metrics.neutral_recall
                 }
             )
 
-            # Log prediction statistics for debugging
-            pred_stats = compute_prediction_stats(val_preds)
-            logger.info(f"  Prediction Stats: mean={pred_stats['mean']:.6f}, std={pred_stats['std']:.6f}, "
-                       f"min={pred_stats['min']:.6f}, max={pred_stats['max']:.6f}")
-            logger.info(f"  Distribution: {pred_stats['pct_positive']*100:.1f}% pos, "
-                       f"{pred_stats['pct_negative']*100:.1f}% neg, "
-                       f"{pred_stats['pct_near_zero']*100:.1f}% near zero")
+            # Log class distribution for debugging
+            pred_counts = np.bincount(val_preds.astype(int), minlength=self.num_classes)
+            tgt_counts = np.bincount(val_targets.astype(int), minlength=self.num_classes)
+            total_pred = pred_counts.sum() if pred_counts.sum() > 0 else 1
+            total_tgt = tgt_counts.sum() if tgt_counts.sum() > 0 else 1
+            logger.info("  Class distribution (pred | true):")
+            for idx, name in enumerate(self.class_names):
+                pred_pct = pred_counts[idx] / total_pred * 100
+                tgt_pct = tgt_counts[idx] / total_tgt * 100
+                logger.info(f"    {idx} ({name}): pred {pred_pct:5.1f}% | true {tgt_pct:5.1f}%")
 
             # Log sample predictions vs targets
             if epoch % 10 == 0 or epoch == 1:
-                self.training_logger.log_validation_details(val_preds, val_targets)
+                self.training_logger.log_validation_details(
+                    val_preds,
+                    val_targets,
+                    task_type="classification",
+                    class_names=self.class_names
+                )
 
             # Check for improvement
             if val_loss < self.best_val_loss:
@@ -569,10 +754,12 @@ class AnalystTrainer:
                 metrics = {
                     'train_loss': train_loss,
                     'val_loss': val_loss,
-                    'train_r2': train_acc,
-                    'val_r2': val_acc,
+                    'train_acc': train_acc,
+                    'val_acc': val_acc,
                     'train_dir_acc': train_dir_acc,
                     'val_dir_acc': val_dir_acc,
+                    'train_macro_f1': train_macro_f1,
+                    'val_macro_f1': class_metrics.macro_f1,
                     'learning_rate': current_lr,
                     'grad_norm': avg_grad_norm
                 }
@@ -584,7 +771,10 @@ class AnalystTrainer:
                     val_predictions=val_preds,
                     val_targets=val_targets,
                     metrics=metrics,
-                    save_name=f'epoch_{epoch:03d}_summary.png'
+                    save_name=f'epoch_{epoch:03d}_summary.png',
+                    task_type="classification",
+                    class_names=self.class_names,
+                    num_classes=self.num_classes
                 )
                 self.visualizer.close_all()
 
@@ -616,13 +806,18 @@ class AnalystTrainer:
             self.visualizer.plot_direction_confusion(
                 final_preds, final_targets,
                 title="Final Direction Classification Performance",
-                save_name="direction_confusion.png"
+                save_name="direction_confusion.png",
+                task_type="classification",
+                up_classes=self.up_classes,
+                down_classes=self.down_classes
             )
 
             self.visualizer.plot_predictions_vs_targets(
                 final_preds, final_targets,
                 title="Final Predictions vs Targets",
-                save_name="predictions_vs_targets.png"
+                save_name="predictions_vs_targets.png",
+                task_type="classification",
+                class_names=self.class_names
             )
 
             # Learning dynamics
@@ -657,8 +852,9 @@ class AnalystTrainer:
             x_1h = x_1h.to(self.device)
             x_4h = x_4h.to(self.device)
 
-            _, pred = self.model(x_15m, x_1h, x_4h)
-            predictions.append(pred.cpu().numpy())
+            _, logits = self.model(x_15m, x_1h, x_4h)
+            pred_classes = torch.argmax(logits, dim=1)
+            predictions.append(pred_classes.cpu().numpy())
             targets.append(tgt.numpy())
 
         self.model.train()
@@ -673,6 +869,8 @@ class AnalystTrainer:
             'val_acc': self.val_accs,
             'train_direction_acc': self.train_direction_accs,
             'val_direction_acc': self.val_direction_accs,
+            'train_macro_f1': self.train_macro_f1s,
+            'val_macro_f1': self.val_macro_f1s,
             'learning_rate': self.learning_rates,
             'grad_norm': self.grad_norms,
             'best_val_loss': self.best_val_loss,
@@ -702,7 +900,12 @@ class AnalystTrainer:
             'best_val_loss': self.best_val_loss,
             'config': {
                 'd_model': self.model.d_model,
-                'context_dim': self.model.context_dim
+                'context_dim': self.model.context_dim,
+                'num_classes': self.model.num_classes,
+                'up_classes': self.up_classes,
+                'down_classes': self.down_classes,
+                'class_names': self.class_names,
+                'class_meta': self.class_meta
             }
         }
 
@@ -737,10 +940,23 @@ def train_analyst(
     Returns:
         Tuple of (trained model, training history)
     """
+    class_names = [
+        "Strong Down (<-0.5σ)",
+        "Weak Down (-0.5σ to -0.1σ)",
+        "Neutral (-0.1σ to +0.1σ)",
+        "Weak Up (+0.1σ to +0.5σ)",
+        "Strong Up (> +0.5σ)"
+    ]
+
     # Default configuration
     if config is None:
         from config.settings import Config
         config = Config().analyst
+
+    num_classes = config.num_classes if hasattr(config, 'num_classes') else len(class_names)
+    class_names = class_names[:num_classes]
+    if len(class_names) < num_classes:
+        class_names += [f"Class {i}" for i in range(len(class_names), num_classes)]
 
     if device is None:
         if torch.backends.mps.is_available():
@@ -765,11 +981,31 @@ def train_analyst(
     logger.info(f"Target distribution: {(valid_target > 0).mean()*100:.1f}% positive, "
                f"{(valid_target < 0).mean()*100:.1f}% negative")
 
+    # Convert to classification labels
+    thresholds = config.class_std_thresholds if hasattr(config, 'class_std_thresholds') else (-0.5, -0.1, 0.1, 0.5)
+    class_labels, class_meta = create_return_classes(
+        target,
+        class_std_thresholds=thresholds
+    )
+    label_counts = class_labels.value_counts(dropna=True).sort_index()
+    total_labels = label_counts.sum() if label_counts.sum() > 0 else 1
+
+    logger.info("Class boundaries (scaled returns):")
+    logger.info(f"  Strong Down (<): {class_meta['strong_down_threshold']:.6f}")
+    logger.info(f"  Weak Down  (<): {class_meta['weak_down_threshold']:.6f}")
+    logger.info(f"  Neutral    (<=): {class_meta['weak_up_threshold']:.6f}")
+    logger.info(f"  Strong Up  (>): {class_meta['strong_up_threshold']:.6f}")
+    logger.info("Class distribution (overall):")
+    for idx, count in label_counts.items():
+        name = class_names[int(idx)] if int(idx) < len(class_names) else f"Class {int(idx)}"
+        pct = count / total_labels * 100
+        logger.info(f"  {int(idx)} ({name}): {count} samples ({pct:.1f}%)")
+
     # Create dataset
     logger.info("Creating dataset...")
     dataset = MultiTimeframeDataset(
         df_15m, df_1h, df_4h,
-        feature_cols, target,
+        feature_cols, target, class_labels,
         lookback_15m=config.lookback_15m if hasattr(config, 'lookback_15m') else 48,
         lookback_1h=config.lookback_1h if hasattr(config, 'lookback_1h') else 24,
         lookback_4h=config.lookback_4h if hasattr(config, 'lookback_4h') else 12
@@ -791,6 +1027,26 @@ def train_analyst(
     logger.info(f"Train size: {train_size} (indices 0-{train_size-1})")
     logger.info(f"Val size: {val_size} (indices {train_size}-{len(dataset)-1})")
     logger.info("Using CHRONOLOGICAL split (train on past, validate on future)")
+
+    # Class weights and split distributions
+    valid_label_array = class_labels.values[dataset.valid_indices]
+    train_label_array = valid_label_array[:train_size].astype(int)
+    val_label_array = valid_label_array[train_size:].astype(int)
+
+    class_weights = compute_class_weights(train_label_array, num_classes, device)
+    logger.info(f"Class weights (normalized): {class_weights.cpu().numpy()}")
+
+    def _log_split_distribution(name: str, labels: np.ndarray):
+        counts = np.bincount(labels, minlength=num_classes)
+        total = counts.sum() if counts.sum() > 0 else 1
+        parts = []
+        for idx, count in enumerate(counts):
+            class_name = class_names[idx] if idx < len(class_names) else f"Class {idx}"
+            parts.append(f"{idx} {class_name}: {count} ({count/total*100:.1f}%)")
+        logger.info(f"{name} class mix: " + " | ".join(parts))
+
+    _log_split_distribution("Train", train_label_array)
+    _log_split_distribution("Val", val_label_array)
 
     # Create data loaders
     batch_size = config.batch_size if hasattr(config, 'batch_size') else 32
@@ -832,7 +1088,13 @@ def train_analyst(
         weight_decay=config.weight_decay if hasattr(config, 'weight_decay') else 1e-5,
         patience=config.patience if hasattr(config, 'patience') else 10,
         log_dir=save_path,
-        visualize=visualize
+        visualize=visualize,
+        num_classes=num_classes,
+        class_weights=class_weights,
+        up_classes=(3, 4),
+        down_classes=(0, 1),
+        class_names=class_names,
+        class_meta=class_meta
     )
 
     # Train
@@ -855,6 +1117,8 @@ def train_analyst(
     logger.info("TRAINING COMPLETE")
     logger.info("=" * 70)
     logger.info(f"Best validation loss: {history['best_val_loss']:.6f}")
+    logger.info(f"Final train accuracy: {history['train_acc'][-1]*100:.2f}%")
+    logger.info(f"Final val accuracy: {history['val_acc'][-1]*100:.2f}%")
     logger.info(f"Final train direction acc: {history['train_direction_acc'][-1]*100:.2f}%")
     logger.info(f"Final val direction acc: {history['val_direction_acc'][-1]*100:.2f}%")
     logger.info(f"Total epochs trained: {history['epochs_trained']}")

@@ -2,8 +2,8 @@
 Market Analyst Model - Complete supervised learning module.
 
 The Analyst produces a dense "Context Vector" that summarizes market state
-across all timeframes. It predicts smoothed future returns to learn
-sustained momentum rather than noise.
+across all timeframes. It predicts a discrete class for smoothed future
+returns (direction-focused) to learn sustained momentum rather than noise.
 
 After training, the Analyst is frozen and its context vector is consumed
 by the PPO Sniper Agent.
@@ -41,7 +41,8 @@ class MarketAnalyst(nn.Module):
         dim_feedforward: int = 128,
         context_dim: int = 64,
         dropout: float = 0.1,
-        use_lightweight: bool = False
+        use_lightweight: bool = False,
+        num_classes: int = 5
     ):
         """
         Args:
@@ -54,11 +55,13 @@ class MarketAnalyst(nn.Module):
             context_dim: Output context vector dimension
             dropout: Dropout rate
             use_lightweight: Use lighter Conv1D encoder instead of Transformer
+            num_classes: Number of discrete return classes for classification head
         """
         super().__init__()
 
         self.d_model = d_model
         self.context_dim = context_dim
+        self.num_classes = num_classes
 
         # Choose encoder type
         EncoderClass = LightweightEncoder if use_lightweight else TransformerEncoder
@@ -127,7 +130,7 @@ class MarketAnalyst(nn.Module):
             nn.Linear(context_dim, context_dim // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(context_dim // 2, 1)
+            nn.Linear(context_dim // 2, num_classes)
         )
 
         # Initialize weights
@@ -135,11 +138,7 @@ class MarketAnalyst(nn.Module):
 
     def _init_weights(self):
         """
-        Initialize linear layer weights.
-        
-        CRITICAL: The final layer of trend_head needs larger weights to produce
-        outputs in the target range (~0.01-0.1 for percentage returns).
-        Standard Xavier init produces outputs that are too small, causing mode collapse.
+        Initialize linear layer weights for stable training.
         """
         for module in [self.context_proj]:
             if isinstance(module, nn.Sequential):
@@ -150,20 +149,12 @@ class MarketAnalyst(nn.Module):
                             nn.init.zeros_(layer.bias)
         
         # Special initialization for trend_head to match target scale
-        # Target std is ~0.088 (percentage returns), so we need larger final layer weights
         if isinstance(self.trend_head, nn.Sequential):
-            for i, layer in enumerate(self.trend_head):
+            for layer in self.trend_head:
                 if isinstance(layer, nn.Linear):
-                    if i == len(list(self.trend_head)) - 1:
-                        # Final layer: use larger weights for correct output scale
-                        # Scale factor ~10x to produce outputs in range [-0.5, 0.5]
-                        nn.init.xavier_uniform_(layer.weight, gain=10.0)
-                        if layer.bias is not None:
-                            nn.init.zeros_(layer.bias)
-                    else:
-                        nn.init.xavier_uniform_(layer.weight)
-                        if layer.bias is not None:
-                            nn.init.zeros_(layer.bias)
+                    nn.init.xavier_uniform_(layer.weight)
+                    if layer.bias is not None:
+                        nn.init.zeros_(layer.bias)
 
     def forward(
         self,
@@ -182,7 +173,7 @@ class MarketAnalyst(nn.Module):
         Returns:
             Tuple of:
                 - context: Context vector [batch, context_dim]
-                - prediction: Trend prediction [batch, 1]
+                - prediction: Class logits [batch, num_classes]
         """
         # Ensure float32
         x_15m = x_15m.float()
@@ -289,7 +280,8 @@ def create_analyst(
             num_layers=2,
             dim_feedforward=128,
             context_dim=64,
-            dropout=0.1
+            dropout=0.1,
+            num_classes=5
         )
     else:
         model = MarketAnalyst(
@@ -299,7 +291,8 @@ def create_analyst(
             num_layers=config.num_layers,
             dim_feedforward=config.dim_feedforward,
             context_dim=config.context_dim,
-            dropout=config.dropout
+            dropout=config.dropout,
+            num_classes=getattr(config, 'num_classes', 5)
         )
 
     if device is not None:
@@ -339,7 +332,8 @@ def load_analyst(
             num_layers=config.get('num_layers', 2),
             dim_feedforward=config.get('dim_feedforward', 128),
             context_dim=config.get('context_dim', 64),
-            dropout=config.get('dropout', 0.1)
+            dropout=config.get('dropout', 0.1),
+            num_classes=config.get('num_classes', 5)
         )
     else:
         model = create_analyst(feature_dims)

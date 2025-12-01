@@ -25,16 +25,21 @@ class FeatureNormalizer:
     - Transforms features to zero mean and unit variance
     - Prevents large-scale features from dominating gradients
     - Must be fit on training data ONLY to prevent look-ahead bias
+    - CLIPS extreme values to prevent ±30+ z-scores from destabilizing training
     """
 
-    def __init__(self, feature_cols: List[str], epsilon: float = 1e-8):
+    def __init__(self, feature_cols: List[str], epsilon: float = 1e-8, clip_zscore: float = 5.0):
         """
         Args:
             feature_cols: List of feature column names to normalize
             epsilon: Small value to prevent division by zero
+            clip_zscore: Clip normalized values to [-clip_zscore, +clip_zscore]
+                        Default 5.0 prevents extreme outliers (>5 std) from
+                        destabilizing gradients. Critical for returns/volatility.
         """
         self.feature_cols = feature_cols
         self.epsilon = epsilon
+        self.clip_zscore = clip_zscore
 
         # Statistics (computed during fit)
         self.means: Optional[Dict[str, float]] = None
@@ -79,13 +84,13 @@ class FeatureNormalizer:
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Apply normalization to DataFrame.
+        Apply normalization to DataFrame with outlier clipping.
 
         Args:
             df: DataFrame to normalize
 
         Returns:
-            Normalized DataFrame (copy)
+            Normalized DataFrame (copy) with values clipped to [-clip_zscore, +clip_zscore]
         """
         if not self.is_fitted:
             raise RuntimeError("Normalizer must be fitted before transform. Call fit() first.")
@@ -94,8 +99,12 @@ class FeatureNormalizer:
 
         for col in self.feature_cols:
             if col in df.columns and col in self.means:
-                df_normalized[col] = (
-                    (df[col] - self.means[col]) / self.stds[col]
+                normalized = (df[col] - self.means[col]) / self.stds[col]
+                # CRITICAL: Clip extreme z-scores to prevent gradient instability
+                # Without this, features like 'returns' can reach ±30-60 z-scores
+                # during volatile periods, causing the model to learn biased shortcuts
+                df_normalized[col] = normalized.clip(
+                    -self.clip_zscore, self.clip_zscore
                 ).astype(np.float32)
 
         return df_normalized
@@ -149,6 +158,7 @@ class FeatureNormalizer:
         state = {
             'feature_cols': self.feature_cols,
             'epsilon': self.epsilon,
+            'clip_zscore': self.clip_zscore,
             'means': self.means,
             'stds': self.stds,
             'is_fitted': self.is_fitted
@@ -173,7 +183,9 @@ class FeatureNormalizer:
         with open(path, 'rb') as f:
             state = pickle.load(f)
 
-        normalizer = cls(state['feature_cols'], state['epsilon'])
+        # Backwards compatibility: older saves may not have clip_zscore
+        clip_zscore = state.get('clip_zscore', 5.0)
+        normalizer = cls(state['feature_cols'], state['epsilon'], clip_zscore)
         normalizer.means = state['means']
         normalizer.stds = state['stds']
         normalizer.is_fitted = state['is_fitted']
