@@ -378,63 +378,27 @@ class TradingEnv(gym.Env):
         Returns:
             Tuple of (reward, info_dict) if triggered, (0.0, {}) otherwise
         """
-        reward = 0.0
-        info = {
-            'stop_loss_triggered': False,
-            'take_profit_triggered': False,
-            'trade_closed': False,
-            'pnl': 0.0
-        }
-
         # No position = nothing to check
         if self.position == 0:
-            return reward, info
+            return 0.0, {}
 
-        # Get current unrealized PnL (sized pips)
-        unrealized_pnl = self._calculate_unrealized_pnl()
-
-        # Raw pips (before position size adjustment) for threshold comparison
+        # Get current price
         current_price = self.close_prices[self.current_idx]
         pip_value = 0.0001
+
+        # Calculate raw pips (before position size adjustment)
         if self.position == 1:  # Long
             raw_pips = (current_price - self.entry_price) / pip_value
         else:  # Short
             raw_pips = (self.entry_price - current_price) / pip_value
 
-        triggered = False
-        trigger_reason = None
-
-        # Check stop-loss (loss exceeds threshold)
-        # Get current ATR for dynamic risk management
+        # Get ATR for dynamic thresholds
         if len(self.market_features.shape) > 1:
             atr = self.market_features[self.current_idx, 0]
         else:
             atr = 0.001  # Default fallback
 
-        # Calculate dynamic SL/TP in pips
-        # ATR is in price units (e.g. 0.0020), pip_value is 0.0001
-        sl_pips = (atr * self.sl_atr_multiplier) / 0.0001
-        tp_pips = (atr * self.tp_atr_multiplier) / 0.0001
-    def _check_stop_loss_take_profit(self, price: float, time: pd.Timestamp) -> Tuple[float, str]:
-        """
-        Check if stop-loss or take-profit is hit.
-        
-        Uses ATR-based dynamic thresholds.
-        """
-        if self.position == 0:
-            return 0.0, ''
-
-        # Calculate PnL in pips
-        raw_pips = self._calculate_pnl_pips(price)
-        
-        # Get ATR for dynamic thresholds
-        atr = 0.0010 # Default fallback
-        if len(self.market_features.shape) > 1:
-            atr = self.market_features[self.current_idx, 0]
-            
         # Calculate dynamic thresholds
-        # SL = 1.5 * ATR
-        # TP = 3.0 * ATR
         sl_pips_threshold = (atr * self.sl_atr_multiplier) / 0.0001
         tp_pips_threshold = (atr * self.tp_atr_multiplier) / 0.0001
         
@@ -445,13 +409,13 @@ class TradingEnv(gym.Env):
         # Check stop-loss (loss exceeds threshold)
         if self.use_stop_loss and raw_pips < -sl_pips_threshold:
             # Calculate realized PnL
-            pnl = self._calculate_unrealized_pnl(price)
+            pnl = self._calculate_unrealized_pnl()
             
             # Close position
             self.total_pnl += pnl
             self.trades.append({
                 'entry': self.entry_price,
-                'exit': price,
+                'exit': current_price,
                 'direction': self.position,
                 'size': self.position_size,
                 'pnl': pnl,
@@ -464,16 +428,21 @@ class TradingEnv(gym.Env):
             self.entry_price = 0.0
             self.prev_unrealized_pnl = 0.0
             
-            return pnl, 'stop_loss'
+            return pnl, {
+                'stop_loss_triggered': True,
+                'trade_closed': True,
+                'close_reason': 'stop_loss',
+                'pnl': pnl
+            }
 
         # Check take-profit (profit exceeds threshold)
         if self.use_take_profit and raw_pips > tp_pips_threshold:
-            pnl = self._calculate_unrealized_pnl(price)
+            pnl = self._calculate_unrealized_pnl()
             
             self.total_pnl += pnl
             self.trades.append({
                 'entry': self.entry_price,
-                'exit': price,
+                'exit': current_price,
                 'direction': self.position,
                 'size': self.position_size,
                 'pnl': pnl,
@@ -485,9 +454,14 @@ class TradingEnv(gym.Env):
             self.entry_price = 0.0
             self.prev_unrealized_pnl = 0.0
             
-            return pnl, 'take_profit'
+            return pnl, {
+                'take_profit_triggered': True,
+                'trade_closed': True,
+                'close_reason': 'take_profit',
+                'pnl': pnl
+            }
 
-        return 0.0, ''
+        return 0.0, {}
 
     def _execute_action(self, action: np.ndarray) -> Tuple[float, dict]:
         """
@@ -796,7 +770,8 @@ def create_env_from_dataframes(
     df_4h: 'pd.DataFrame',
     analyst_model: Optional[torch.nn.Module] = None,
     feature_cols: Optional[list] = None,
-    config: Optional[object] = None
+    config: Optional[object] = None,
+    device: Optional[torch.device] = None
 ) -> TradingEnv:
     """
     Factory function to create TradingEnv from DataFrames.
@@ -810,6 +785,7 @@ def create_env_from_dataframes(
         analyst_model: Trained Market Analyst
         feature_cols: Feature columns to use
         config: TradingConfig object
+        device: Torch device for analyst inference
 
     Returns:
         TradingEnv instance
@@ -878,5 +854,6 @@ def create_env_from_dataframes(
         analyst_model=analyst_model,
         lookback_15m=lookback_15m,
         lookback_1h=lookback_1h,
-        lookback_4h=lookback_4h
+        lookback_4h=lookback_4h,
+        device=device
     )

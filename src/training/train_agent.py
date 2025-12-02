@@ -570,10 +570,20 @@ def train_agent(
 
     # Load frozen analyst
     logger.info(f"Loading analyst from {analyst_path}")
+    # Use the same features as Analyst training (11 base + 7 extra = 18 features)
+    model_features = [
+        'returns', 'volatility', 'pinbar', 'engulfing', 'doji',
+        'ema_trend', 'ema_crossover', 'regime', 'sma_distance',
+        'dist_to_resistance', 'dist_to_support',
+        # Extra features added during training
+        'session_asian', 'session_london', 'session_ny',
+        'bos_bullish', 'bos_bearish', 'choch_bullish', 'choch_bearish'
+    ]
+    
     feature_dims = {
-        '15m': len(feature_cols),
-        '1h': len(feature_cols),
-        '4h': len(feature_cols)
+        '15m': len(model_features),
+        '1h': len(model_features),
+        '4h': len(model_features)
     }
     analyst = load_analyst(analyst_path, feature_dims, device, freeze=True)
     logger.info("Analyst loaded and frozen")

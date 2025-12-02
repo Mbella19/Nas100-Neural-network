@@ -100,15 +100,15 @@ class DataConfig:
 @dataclass
 class AnalystConfig:
     """Market Analyst (Transformer) configuration."""
-    d_model: int = 32           # Reduced from 64
-    nhead: int = 2              # Reduced from 4
-    num_layers: int = 1         # Reduced from 2
-    dim_feedforward: int = 64   # Reduced from 128
-    dropout: float = 0.4        # INCREASED to stop overfitting
-    context_dim: int = 64       
+    d_model: int = 128          # Increased from 32/64
+    nhead: int = 4              # Increased from 2
+    num_layers: int = 4         # Increased from 1/2
+    dim_feedforward: int = 256  # Increased from 64/128
+    dropout: float = 0.3        # Adjusted for larger model
+    context_dim: int = 128      # Matched to d_model
 
-    batch_size: int = 64
-    learning_rate: float = 1e-3
+    batch_size: int = 128       # Increased to smooth out gradients
+    learning_rate: float = 1e-4 # Reduced 10x to prevent divergence
     weight_decay: float = 1e-2  # INCREASED to stop overfitting
     max_epochs: int = 100
     patience: int = 15          
@@ -117,7 +117,7 @@ class AnalystConfig:
     future_window: int = 48     # 12 Hours (Smoother Target)
     smooth_window: int = 48     
     num_classes: int = 3        
-    class_std_thresholds: Tuple[float, float] = (-0.75, 0.75) # Widen to filter noise
+    class_std_thresholds: Tuple[float, float] = (-0.15, 0.15)   # Narrowed to force trend detection
 
 
 @dataclass
@@ -168,7 +168,7 @@ class AgentConfig:
     max_grad_norm: float = 0.5
 
     # Training
-    total_timesteps: int = 500_000
+    total_timesteps: int = 5_000_000
 
     # Policy network
     policy_type: str = "MlpPolicy"
