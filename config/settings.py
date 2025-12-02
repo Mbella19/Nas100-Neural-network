@@ -119,6 +119,11 @@ class AnalystConfig:
     num_classes: int = 3        
     class_std_thresholds: Tuple[float, float] = (-0.15, 0.15)   # Narrowed to force trend detection
 
+    # Input Lookback Windows (Must match DataConfig)
+    lookback_15m: int = 20      # 5 Hours
+    lookback_1h: int = 24       # 24 Hours
+    lookback_4h: int = 12       # 48 Hours
+
 
 @dataclass
 class TradingConfig:

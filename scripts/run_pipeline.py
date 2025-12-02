@@ -351,7 +351,7 @@ def step_5_train_agent(
         feature_cols=feature_cols,
         analyst_path=analyst_path,
         save_path=save_path,
-        config=config.agent,
+        config=config,
         device=device,
         total_timesteps=config.agent.total_timesteps
     )

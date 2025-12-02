@@ -354,7 +354,7 @@ def prepare_env_data(
     df_1h,
     df_4h,
     feature_cols: list,
-    lookback_15m: int = 48,
+    lookback_15m: int = 20,
     lookback_1h: int = 24,
     lookback_4h: int = 12
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -617,9 +617,9 @@ def train_agent(
         if col not in feature_cols:
             feature_cols.append(col)
 
-    lookback_15m = 48
-    lookback_1h = 24
-    lookback_4h = 12
+    lookback_15m = config.analyst.lookback_15m
+    lookback_1h = config.analyst.lookback_1h
+    lookback_4h = config.analyst.lookback_4h
 
     data_15m, data_1h, data_4h, close_prices, market_features = prepare_env_data(
         df_15m, df_1h, df_4h, feature_cols,
