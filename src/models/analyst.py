@@ -223,6 +223,30 @@ class MarketAnalyst(nn.Module):
         context, _ = self.forward(x_15m, x_1h, x_4h)
         return context
 
+    @torch.no_grad()
+    def get_probabilities(
+        self,
+        x_15m: torch.Tensor,
+        x_1h: torch.Tensor,
+        x_4h: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Get context vector AND probabilities (for RL agent).
+
+        Args:
+            x_15m: 15-minute features [batch, seq_len, features]
+            x_1h: 1-hour features [batch, seq_len, features]
+            x_4h: 4-hour features [batch, seq_len, features]
+
+        Returns:
+            Tuple of:
+                - context: Context vector [batch, context_dim]
+                - probs: Softmax probabilities [batch, num_classes]
+        """
+        context, logits = self.forward(x_15m, x_1h, x_4h)
+        probs = torch.softmax(logits, dim=-1)
+        return context, probs
+
     def freeze(self):
         """
         Freeze all parameters for use with RL agent.

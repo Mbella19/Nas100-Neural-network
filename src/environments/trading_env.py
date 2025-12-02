@@ -185,8 +185,9 @@ class TradingEnv(gym.Env):
 
         # Observation space
         # Context vector + position state (3) + market features (5)
+        # + Analyst Probs (3) + Edge (1) + Confidence (1) + Uncertainty (1) = +6
         n_market_features = market_features.shape[1] if len(market_features.shape) > 1 else 5
-        obs_dim = context_dim + 3 + n_market_features
+        obs_dim = context_dim + 3 + n_market_features + 6
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -225,6 +226,7 @@ class TradingEnv(gym.Env):
 
         # Precompute context vectors if analyst is provided
         self._precomputed_contexts = None
+        self._precomputed_probs = None
         if self.analyst is not None:
             self._precompute_contexts()
 
@@ -237,6 +239,7 @@ class TradingEnv(gym.Env):
         self.analyst.eval()
 
         contexts = []
+        probs_list = []
         batch_size = 64
 
         with torch.no_grad():
@@ -261,9 +264,19 @@ class TradingEnv(gym.Env):
                     dtype=torch.float32
                 )
 
-                # Get context
-                context = self.analyst.get_context(batch_15m, batch_1h, batch_4h)
-                contexts.append(context.cpu().numpy())
+                # Get context AND probabilities
+                if hasattr(self.analyst, 'get_probabilities'):
+                    context, probs = self.analyst.get_probabilities(batch_15m, batch_1h, batch_4h)
+                    contexts.append(context.cpu().numpy())
+                    probs_list.append(probs.cpu().numpy())
+                else:
+                    # Fallback for old models
+                    context = self.analyst.get_context(batch_15m, batch_1h, batch_4h)
+                    contexts.append(context.cpu().numpy())
+                    # Default probs (neutral)
+                    dummy_probs = np.zeros((len(context), 3), dtype=np.float32)
+                    dummy_probs[:, 1] = 1.0 # All neutral
+                    probs_list.append(dummy_probs)
 
                 # Memory cleanup
                 del batch_15m, batch_1h, batch_4h, context
@@ -273,15 +286,19 @@ class TradingEnv(gym.Env):
                     gc.collect()
 
         self._precomputed_contexts = np.vstack(contexts).astype(np.float32)
-        print(f"Precomputed {len(self._precomputed_contexts)} context vectors")
+        self._precomputed_probs = np.vstack(probs_list).astype(np.float32)
+        print(f"Precomputed {len(self._precomputed_contexts)} context vectors and probabilities")
 
-    def _get_context(self, idx: int) -> np.ndarray:
-        """Get context vector for current index."""
-        if self._precomputed_contexts is not None:
+    def _get_analyst_data(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Get context vector and probabilities for current index."""
+        if self._precomputed_contexts is not None and self._precomputed_probs is not None:
             # Use precomputed
             context_idx = idx - self.start_idx
             if 0 <= context_idx < len(self._precomputed_contexts):
-                return self._precomputed_contexts[context_idx]
+                return (
+                    self._precomputed_contexts[context_idx],
+                    self._precomputed_probs[context_idx]
+                )
 
         if self.analyst is not None:
             # Compute on-the-fly
@@ -301,16 +318,45 @@ class TradingEnv(gym.Env):
                     device=self.device,
                     dtype=torch.float32
                 )
-                context = self.analyst.get_context(x_15m, x_1h, x_4h)
-                return context.cpu().numpy().flatten()
+                
+                if hasattr(self.analyst, 'get_probabilities'):
+                    context, probs = self.analyst.get_probabilities(x_15m, x_1h, x_4h)
+                    return context.cpu().numpy().flatten(), probs.cpu().numpy().flatten()
+                else:
+                    context = self.analyst.get_context(x_15m, x_1h, x_4h)
+                    # Dummy probs
+                    probs = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                    return context.cpu().numpy().flatten(), probs
 
         # No analyst - return zeros
-        return np.zeros(self.context_dim, dtype=np.float32)
+        return (
+            np.zeros(self.context_dim, dtype=np.float32),
+            np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        )
 
     def _get_observation(self) -> np.ndarray:
         """Construct observation vector."""
-        # Context vector
-        context = self._get_context(self.current_idx)
+        # Context vector and probabilities
+        context, probs = self._get_analyst_data(self.current_idx)
+
+        # Calculate Analyst Metrics
+        # probs = [p_down, p_neutral, p_up]
+        p_down = probs[0]
+        p_neutral = probs[1]
+        p_up = probs[2]
+        
+        edge = p_up - p_down
+        confidence = np.max(probs)
+        
+        # Entropy (Uncertainty)
+        # Clip to avoid log(0)
+        probs_safe = np.clip(probs, 1e-6, 1.0)
+        uncertainty = -np.sum(probs_safe * np.log(probs_safe))
+        
+        analyst_metrics = np.array([
+            p_down, p_neutral, p_up,
+            edge, confidence, uncertainty
+        ], dtype=np.float32)
 
         # Position state
         current_price = self.close_prices[self.current_idx]
@@ -348,7 +394,7 @@ class TradingEnv(gym.Env):
             market_feat = np.zeros(5, dtype=np.float32)
 
         # Combine all (all components now on similar scales)
-        obs = np.concatenate([context, position_state, market_feat])
+        obs = np.concatenate([context, position_state, market_feat, analyst_metrics])
 
         return obs.astype(np.float32)
 
