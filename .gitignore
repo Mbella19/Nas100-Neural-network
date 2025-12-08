@@ -39,6 +39,7 @@ env/
 
 # Data files (Exclude entire directory)
 data/
+!src/data/
 
 # Model checkpoints (Exclude entire directory to avoid large binaries)
 models/

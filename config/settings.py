@@ -164,10 +164,11 @@ class AnalystConfig:
 
 
 @dataclass
+@dataclass
 class TradingConfig:
     """Trading environment configuration."""
-    spread_pips: float = 0.2    # Razor/Raw spread (was 1.0)
-    slippage_pips: float = 0.5  # Includes commission + slippage (was 0.5)
+    spread_pips: float = 0.2    # Razor/Raw spread
+    slippage_pips: float = 0.5  # Includes commission + slippage
     
     # NEW: Enforce Analyst Alignment (Action Masking)
     # If True, Agent can ONLY trade in direction of Analyst (or Flat)
@@ -189,9 +190,9 @@ class TradingConfig:
     # Reward Params
     # FIX: Previous penalties were 10x too high, dominating PnL rewards
     # A 50-pip trade at 0.2 scaling = 10 reward, but 30x FOMO @ -0.5 = -15 penalty
-    fomo_penalty: float = 0.0     # Disabled
+    fomo_penalty: float = -0.05   # Small penalty (-5 pips equiv) for missing moves
     chop_penalty: float = 0.0     # Disabled
-    fomo_threshold_atr: float = 2.0  # Was 1.0 (only trigger on significant moves)
+    fomo_threshold_atr: float = 2  # Trigger on >1.5x ATR moves (was 2.0)
     chop_threshold: float = 80.0     # Was 70.0 (only extreme chop triggers penalty)
     reward_scaling: float = 0.01     # 1.0 per 100 pips
     
@@ -202,6 +203,9 @@ class TradingConfig:
     # Environment settings
     max_steps_per_episode: int = 500    # Reduced to ~1 week (was 2000) for rapid regime cycling
     initial_balance: float = 10000.0
+    
+    # Validation
+    noise_level: float = 0.02  # Reduced to 2% to encourage more activity (was 5%)
 
 
 @dataclass
@@ -210,14 +214,14 @@ class AgentConfig:
 
     # PPO hyperparameters (from CLAUDE.md spec)
     # FIX: Reduced LR for stable convergence, increased entropy to escape local minima
-    learning_rate: float = 1e-4  # Was 3e-4 (reduced for more stable updates)
+    learning_rate: float = 3e-4  # Increased to 3e-4 to help escape local minima
     n_steps: int = 2048         # Increased for better batching
     batch_size: int = 256       # Increased from 64
-    n_epochs: int = 20
+    n_epochs: int = 20          # Reduced to 10 to prevent overfitting
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    ent_coef: float = 0.02       # Standard exploration
+    ent_coef: float = 0.05       # Increased to 5% to FORCE exploration (unfreeze)
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
 
@@ -226,7 +230,7 @@ class AgentConfig:
 
     # Policy network
     policy_type: str = "MlpPolicy"
-    net_arch: List[int] = field(default_factory=lambda: [256, 256])
+    net_arch: List[int] = field(default_factory=lambda: [64, 64])
 
 
 @dataclass

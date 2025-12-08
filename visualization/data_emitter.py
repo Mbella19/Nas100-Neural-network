@@ -82,6 +82,9 @@ class DataEmitter:
 
         # Enable flag
         self._enabled: bool = True
+        
+        # Start background worker
+        self._start_background_worker()
 
     def enable(self):
         """Enable data emission."""
@@ -446,13 +449,25 @@ class DataEmitter:
                 pass
 
         # Also try to push to remote server (for client mode / training script)
-        # We do this in a separate thread to avoid blocking training
-        if not self.config.server_mode:
-            threading.Thread(
-                target=self._send_to_server,
-                args=(snapshot,),
-                daemon=True
-            ).start()
+        # We NO LONGER spawn a thread per request to avoid OOM
+        pass 
+
+    def _start_background_worker(self):
+        """Start background worker for sending data."""
+        if not self.config.server_mode and not hasattr(self, '_worker_thread'):
+            self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+            self._worker_thread.start()
+
+    def _worker_loop(self):
+        """Worker loop to consume queue and send to server."""
+        import requests
+        while True:
+            try:
+                snapshot = self._queue.get()
+                self._send_to_server(snapshot)
+                self._queue.task_done()
+            except Exception:
+                pass
 
     def _send_to_server(self, snapshot: TrainingSnapshot):
         """Send snapshot to visualization server via HTTP."""
@@ -464,11 +479,15 @@ class DataEmitter:
                 data = orjson.loads(snapshot.model_dump_json())
             except ImportError:
                 data = snapshot.model_dump(mode='json')
-
-            requests.post(
+            
+            # Use session for connection pooling
+            if not hasattr(self, '_session'):
+                self._session = requests.Session()
+            
+            self._session.post(
                 f"{self.config.frontend_url.replace('3000', '8000')}/api/ingest",
                 json=data,
-                timeout=0.1  # Very short timeout to not block
+                timeout=0.1 
             )
         except Exception:
             pass  # Fail silently if server is down

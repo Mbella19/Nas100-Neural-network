@@ -737,8 +737,9 @@ def create_trading_env(
         fomo_threshold_atr=fomo_threshold_atr,
         chop_threshold=chop_threshold,
         max_steps=max_steps,
-        reward_scaling=reward_scaling,
+        reward_scaling=config.reward_scaling if config else 0.01,
         device=device,
+        noise_level=config.noise_level if config else 0.0,
         market_feat_mean=market_feat_mean,
         market_feat_std=market_feat_std,
         # Risk Management
@@ -775,7 +776,8 @@ def train_agent(
     save_path: str,
     config: Optional[object] = None,
     device: Optional[torch.device] = None,
-    total_timesteps: int = 500_000
+    total_timesteps: int = 500_000,
+    resume_path: Optional[str] = None
 ) -> Tuple[SniperAgent, Dict]:
     """
     Main function to train the PPO Sniper Agent.
@@ -954,16 +956,18 @@ def train_agent(
             train_analyst_cache = {
                 'contexts': full_cache['contexts'][:cache_split_idx],
                 'probs': full_cache['probs'][:cache_split_idx],
-                'activations_15m': full_cache.get('activations_15m')[:cache_split_idx] if full_cache.get('activations_15m') is not None else None,
-                'activations_1h': full_cache.get('activations_1h')[:cache_split_idx] if full_cache.get('activations_1h') is not None else None,
-                'activations_4h': full_cache.get('activations_4h')[:cache_split_idx] if full_cache.get('activations_4h') is not None else None,
+                # DISABLED ACTIVATIONS TO SAVE MEMORY (OOM Protection)
+                'activations_15m': None, 
+                'activations_1h': None,
+                'activations_4h': None,
             }
             eval_analyst_cache = {
                 'contexts': full_cache['contexts'][cache_split_idx:],
                 'probs': full_cache['probs'][cache_split_idx:],
-                'activations_15m': full_cache.get('activations_15m')[cache_split_idx:] if full_cache.get('activations_15m') is not None else None,
-                'activations_1h': full_cache.get('activations_1h')[cache_split_idx:] if full_cache.get('activations_1h') is not None else None,
-                'activations_4h': full_cache.get('activations_4h')[cache_split_idx:] if full_cache.get('activations_4h') is not None else None,
+                # DISABLED ACTIVATIONS TO SAVE MEMORY (OOM Protection)
+                'activations_15m': None,
+                'activations_1h': None,
+                'activations_4h': None,
             }
             logger.info(f"Using sequential Analyst context: train={len(train_analyst_cache['contexts'])}, eval={len(eval_analyst_cache['contexts'])}")
         except Exception as e:
@@ -977,7 +981,8 @@ def train_agent(
     # FIX: If using regime sampling, we MUST use synthetic timestamps for visualization
     # Real timestamps will jump (e.g. 2022 -> 2018), causing the chart to look broken/gap-filled.
     # Synthetic timestamps ensure a continuous, smooth chart for the agent's experience.
-    use_regime_sampling_train = True # Explicitly define this for clarity
+    # regime sampling is DISABLED to prevent overfitting to artificial trend distributions
+    use_regime_sampling_train = False # Explicitly define this for clarity
     viz_timestamps = train_timestamps
     if use_regime_sampling_train:
         logger.info("Regime sampling enabled: Using SYNTHETIC timestamps for visualization to prevent chart gaps.")
@@ -1001,7 +1006,7 @@ def train_agent(
     eval_env = create_trading_env(
         *eval_data,
         analyst_model=analyst,
-        config=config,
+        config=config.trading,
         device=device,
         market_feat_mean=market_feat_mean,  # Use TRAINING stats for eval too
         market_feat_std=market_feat_std,
@@ -1021,8 +1026,12 @@ def train_agent(
     eval_env = Monitor(eval_env)
 
     # Create agent
-    logger.info("Creating PPO agent...")
-    agent = create_agent(train_env, config.agent)
+    if resume_path and Path(resume_path).exists():
+        logger.info(f"Resuming PPO agent from checkpoint: {resume_path}")
+        agent = SniperAgent.load(resume_path, env=train_env, device=device)
+    else:
+        logger.info("Creating PPO agent...")
+        agent = create_agent(train_env, config.agent)
 
     # Create training logger callback
     training_callback = AgentTrainingLogger(

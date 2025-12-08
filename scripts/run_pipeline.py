@@ -334,7 +334,8 @@ def step_5_train_agent(
     df_4h: pd.DataFrame,
     feature_cols: list,
     config: Config,
-    device: torch.device
+    device: torch.device,
+    resume_path: str = None
 ) -> SniperAgent:
     """
     Step 5: Train the PPO Sniper Agent.
@@ -355,7 +356,8 @@ def step_5_train_agent(
         save_path=save_path,
         config=config,
         device=device,
-        total_timesteps=config.agent.total_timesteps
+        total_timesteps=config.agent.total_timesteps,
+        resume_path=resume_path
     )
 
     logger.info(f"Agent training complete.")
@@ -420,10 +422,14 @@ def step_6_backtest(
     )
 
     # Create test environment with TRAINING stats (prevents look-ahead bias)
+    # FIX: Disable noise for backtesting (evaluation must be on clean data)
+    test_config = config.trading
+    test_config.noise_level = 0.0
+    
     test_env = create_trading_env(
         *test_data,
         analyst_model=analyst,
-        config=config.trading,
+        config=test_config,
         device=device,
         market_feat_mean=market_feat_mean,
         market_feat_std=market_feat_std
@@ -467,6 +473,7 @@ def main():
     parser.add_argument('--backtest-only', action='store_true', help='Only run backtest with existing models')
     parser.add_argument('--visualization', '-v', action='store_true',
                        help='Enable real-time visualization dashboard')
+    parser.add_argument('--resume', type=str, help='Path to checkpoint to resume training from')
     args = parser.parse_args()
 
     # Initialize
@@ -552,7 +559,8 @@ def main():
             # Step 5: Train Agent (on NORMALIZED data)
             if not args.skip_agent:
                 agent = step_5_train_agent(
-                    df_15m, df_1h, df_4h, feature_cols, config, device
+                    df_15m, df_1h, df_4h, feature_cols, config, device,
+                    resume_path=args.resume
                 )
                 del agent  # Free memory
                 clear_memory()
