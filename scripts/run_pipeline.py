@@ -373,7 +373,9 @@ def step_6_backtest(
     df_4h: pd.DataFrame,
     feature_cols: list,
     config: Config,
-    device: torch.device
+    device: torch.device,
+    model_path: str = None,
+    min_action_confidence: float = 0.0
 ):
     """
     Step 6: Run out-of-sample backtest and compare with baseline.
@@ -384,7 +386,15 @@ def step_6_backtest(
 
     # Load trained models
     analyst_path = config.paths.models_analyst / 'best.pt'
-    agent_path = config.paths.models_agent / 'final_model.zip'
+    
+    if model_path:
+        agent_path = Path(model_path)
+        if not agent_path.exists():
+            logger.error(f"Model not found at: {agent_path}")
+            sys.exit(1)
+        logger.info(f"Using custom agent model: {agent_path}")
+    else:
+        agent_path = config.paths.models_agent / 'final_model.zip'
 
     feature_dims = {'15m': len(feature_cols), '1h': len(feature_cols), '4h': len(feature_cols)}
     analyst = load_analyst(str(analyst_path), feature_dims, device, freeze=True)
@@ -441,7 +451,12 @@ def step_6_backtest(
     agent = SniperAgent.load(str(agent_path), test_env, device='cpu')
 
     # Run backtest
-    results = run_backtest(agent, test_env.unwrapped)
+    results = run_backtest(
+        agent=agent,
+        env=test_env.unwrapped,
+        min_action_confidence=min_action_confidence,
+        spread_pips=config.trading.spread_pips + config.trading.slippage_pips
+    )
 
     # Compare with buy-and-hold
     comparison = compare_with_baseline(
@@ -474,6 +489,8 @@ def main():
     parser.add_argument('--visualization', '-v', action='store_true',
                        help='Enable real-time visualization dashboard')
     parser.add_argument('--resume', type=str, help='Path to checkpoint to resume training from')
+    parser.add_argument('--model-path', type=str, help='Path to specific agent model for backtesting')
+    parser.add_argument('--min-confidence', type=float, default=0.0, help='Minimum confidence threshold (0.0-1.0)')
     args = parser.parse_args()
 
     # Initialize
@@ -567,7 +584,9 @@ def main():
 
         # Step 6: Backtest
         results, comparison = step_6_backtest(
-            df_15m, df_1h, df_4h, feature_cols, config, device
+            df_15m, df_1h, df_4h, feature_cols, config, device,
+            model_path=args.model_path,
+            min_action_confidence=args.min_confidence
         )
 
         # Final summary

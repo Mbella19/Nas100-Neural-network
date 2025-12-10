@@ -169,7 +169,10 @@ class TradingConfig:
     """Trading environment configuration."""
     spread_pips: float = 0.2    # Razor/Raw spread
     slippage_pips: float = 0.5  # Includes commission + slippage
-    
+
+    # Confidence filtering: Only take trades when agent probability >= threshold
+    min_action_confidence: float = 0.95  # Filter low-confidence trades (0.0 = disabled)
+
     # NEW: Enforce Analyst Alignment (Action Masking)
     # If True, Agent can ONLY trade in direction of Analyst (or Flat)
     # DISABLED: Soft masking breaks PPO gradients - agent samples action X, gets

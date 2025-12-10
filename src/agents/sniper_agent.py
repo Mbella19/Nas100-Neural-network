@@ -285,19 +285,95 @@ class SniperAgent:
     def predict(
         self,
         observation: np.ndarray,
-        deterministic: bool = True
+        deterministic: bool = True,
+        min_action_confidence: float = 0.0
     ) -> tuple:
         """
-        Predict action for given observation.
+        Predict action for given observation with optional confidence threshold.
 
         Args:
             observation: Current observation
             deterministic: Use deterministic policy
+            min_action_confidence: Minimum probability required to take a non-flat action.
+                                 If confidence < threshold, action is forced to Flat (0).
+                                 Only applies to Direction (action[0]).
 
         Returns:
             Tuple of (action, states)
         """
+        # Standard prediction
         action, states = self.model.predict(observation, deterministic=deterministic)
+
+        # Apply confidence thresholding if requested
+        if min_action_confidence > 0.0:
+            # We need to get the probabilities from the policy
+            # Convert observation to tensor
+            obs_tensor, _ = self.model.policy.obs_to_tensor(observation)
+            
+            # Get distribution
+            with torch.no_grad():
+                dist = self.model.policy.get_distribution(obs_tensor)
+            
+            # Calculate probabilities from logits
+            # SB3 MultiCategoricalDistribution stores logits in a specific way.
+            # For MultiDiscrete, we usually have a list of Categorical distributions
+            # or concatenated logits.
+            
+            # Helper to get probs for the first dimension (Direction)
+            # The action space is MultiDiscrete.
+            # dist.distribution is usually a list of Categorical distributions
+            # IF using Independent(OneHotCategorical) or similar.
+            
+            # Accessing logits/probs directly depends on SB3 implementation details.
+            # A robust way is to inspect `dist.distribution.probs` if available, 
+            # or `dist.distribution` params.
+            
+            # For MultiDiscrete, SB3 often flattens the logits.
+            # We know Direction is the first component.
+            # Let's assume standard SB3 implementation for MultiDiscrete.
+            
+            # Safe access to probabilities for the Direction component (index 0)
+            try:
+                # Check if dist.distribution is a list (SB3 MultiDiscrete behavior)
+                if isinstance(dist.distribution, list):
+                    # Index 0 is Direction, Index 1 is Size
+                    direction_dist = dist.distribution[0]
+                    direction_probs = direction_dist.probs # Shape: (batch_size, 3)
+                else:
+                    # Fallback for other potential structures
+                    # Try to access logits directly if not a list
+                    all_logits = dist.distribution.logits
+                    direction_logits = all_logits[:, :3]
+                    direction_probs = torch.softmax(direction_logits, dim=1)
+
+                # Get confidence of the CHOSEN action for Direction
+                # Check if vectorized (batch size > 1) or single
+                if len(action.shape) == 1:
+                    # Single environment, action is [dir, size, ...]
+                    chosen_dir = action[0]
+                    confidence = direction_probs[0, chosen_dir].item()
+                    
+                    if confidence < min_action_confidence and chosen_dir != 0:
+                        # DEBUG: Print intervention
+                        # print(f"THRESHOLD INTERVENTION: Action {chosen_dir} (Conf {confidence:.2f} < {min_action_confidence}) -> FLAT")
+                        # Force Flat
+                        action[0] = 0
+                        
+                else:
+                    # Vectorized environments (n_envs, n_actions)
+                    # Iterate over envs
+                    for i in range(len(action)):
+                        chosen_dir = action[i, 0]
+                        confidence = direction_probs[i, chosen_dir].item()
+                        
+                        if confidence < min_action_confidence and chosen_dir != 0:
+                            # Force Flat
+                            action[i, 0] = 0
+                            
+            except Exception as e:
+                # print(f"DEBUG: Confidence check failed: {e}")
+                pass # Silently fail if structure mismatch to avoid crashing trade execution
+
         return action, states
 
     def evaluate(

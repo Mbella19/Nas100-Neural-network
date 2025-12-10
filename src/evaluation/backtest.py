@@ -381,7 +381,9 @@ def run_backtest(
     sl_atr_multiplier: float = 1.5,
     tp_atr_multiplier: float = 3.0,
     use_stop_loss: bool = True,
-    use_take_profit: bool = True
+    use_take_profit: bool = True,
+    min_action_confidence: float = 0.0,
+    spread_pips: float = 1.5
 ) -> BacktestResult:
     """
     Run a full backtest with the trained agent.
@@ -401,6 +403,8 @@ def run_backtest(
         tp_atr_multiplier: Take Profit multiplier
         use_stop_loss: Enable/disable stop-loss mechanism
         use_take_profit: Enable/disable take-profit mechanism
+        min_action_confidence: Minimum confidence threshold for trades (0.0=disabled)
+        spread_pips: Spread cost per trade in pips
 
     Returns:
         BacktestResult with all metrics and trades
@@ -418,6 +422,9 @@ def run_backtest(
                 f"({max_steps * 15 / 60 / 24:.1f} days of 15m data)")
     logger.info(f"Risk Management: SL={sl_atr_multiplier}x ATR (enabled={use_stop_loss}), "
                 f"TP={tp_atr_multiplier}x ATR (enabled={use_take_profit})")
+    
+    if min_action_confidence > 0.0:
+        logger.info(f"Confidence Threshold: {min_action_confidence:.2f}")
 
     backtester = Backtester(
         initial_balance=initial_balance,
@@ -440,7 +447,11 @@ def run_backtest(
 
     while not done and not truncated:
         # Get action from agent
-        action, _ = agent.predict(obs, deterministic=deterministic)
+        action, _ = agent.predict(
+            obs, 
+            deterministic=deterministic,
+            min_action_confidence=min_action_confidence
+        )
 
         # Step environment
         obs, reward, done, truncated, info = env.step(action)
@@ -470,7 +481,7 @@ def run_backtest(
             atr = env.market_features[bar_idx, 0]
 
         # Step backtester with high/low/close for accurate SL/TP detection
-        backtester.step(action, high, low, close, time, atr=atr)
+        backtester.step(action, high, low, close, time, atr=atr, spread_pips=spread_pips)
 
         step += 1
 
