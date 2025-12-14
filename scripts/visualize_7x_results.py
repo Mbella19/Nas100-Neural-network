@@ -22,11 +22,8 @@ def plot_7x_results():
     with open(base_dir / "metrics.json", "r") as f:
         metrics = json.load(f)
 
-    # Create synthetic timestamps for equity curve (assuming 5m steps)
-    # Match the start time of the first trade roughly, or just start at 0
-    # The backtest used "Now" + timedelta. The first trade is at 2025-12-16 12:48
-    # Let's just use Steps for X-axis to avoid confusion with fake dates, 
-    # but label them as "Days" (Step * 5min / 60 / 24)
+    # Use step index for the x-axis (no fake date axis).
+    # Label as elapsed trading days: step * 5min / 60 / 24.
     steps = np.arange(len(equity_curve))
     days = steps * 5 / (60 * 24)
 

@@ -944,16 +944,11 @@ def train_agent(
         logger.info(f"To enable sequential context, run: python src/training/precompute_analyst.py")
 
     # Create training environment
-    # FIX: ENABLE regime sampling to balance training across market regimes
-    # Without this, agent sees 61% Ranging data and learns "stay flat" as default
-    # Note: Use synthetic timestamps for visualization when regime sampling is enabled
-    # to prevent chart gaps from timestamp jumps (e.g. 2022 -> 2018)
+    # ENABLE regime sampling to balance training across market regimes.
+    # NOTE: We always pass REAL timestamps (no synthetic timeline).
     use_regime_sampling_train = True  # ENABLED: Critical for balanced directional learning
-    viz_timestamps = train_timestamps
     if use_regime_sampling_train:
         logger.info("Regime sampling ENABLED: Agent will see 33% Bullish, 33% Ranging, 33% Bearish")
-        logger.info("Using SYNTHETIC timestamps for visualization to prevent chart gaps.")
-        viz_timestamps = None
 
     train_env = create_trading_env(
         data_15m=train_data[0],
@@ -972,7 +967,7 @@ def train_agent(
         use_regime_sampling=use_regime_sampling_train,
         precomputed_analyst_cache=train_analyst_cache,
         ohlc_data=train_ohlc,
-        timestamps=viz_timestamps,
+        timestamps=train_timestamps,
     )
 
     logger.info("Creating evaluation environment...")

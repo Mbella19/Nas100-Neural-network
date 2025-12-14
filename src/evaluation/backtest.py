@@ -380,20 +380,17 @@ def run_backtest(
     deterministic: bool = True,
     start_idx: Optional[int] = None,
     max_steps: Optional[int] = None,
-    # Risk Management (defaults from config)
-    sl_atr_multiplier: float = 1.5,
-    tp_atr_multiplier: float = 3.0,
-    use_stop_loss: bool = True,
-    use_take_profit: bool = True,
     min_action_confidence: float = 0.0,
-    spread_pips: float = 1.5
 ) -> BacktestResult:
     """
     Run a full backtest with the trained agent.
 
-    CRITICAL FIX: Now backtests on the FULL test set, not just a random 2000-step window!
-    - Pass start_idx to begin at the start of test set (not random)
-    - Set max_steps to cover entire test period (not default 2000)
+    1:1 EXECUTION MATCH WITH PPO TRAINING:
+    This backtest executes trades and risk management using the SAME `TradingEnv`
+    mechanics that PPO was trained in (sizing, SL/TP, spread+slippage, etc).
+
+    This avoids divergence caused by using a separate "Backtester" simulator with
+    different sizing or SL/TP rules.
 
     Args:
         agent: Trained SniperAgent
@@ -402,17 +399,13 @@ def run_backtest(
         deterministic: Use deterministic policy
         start_idx: Starting index (if None, uses env.start_idx for full coverage)
         max_steps: Max steps for episode (if None, uses remaining data length)
-        sl_atr_multiplier: Stop Loss multiplier
-        tp_atr_multiplier: Take Profit multiplier
-        use_stop_loss: Enable/disable stop-loss mechanism
-        use_take_profit: Enable/disable take-profit mechanism
         min_action_confidence: Minimum confidence threshold for trades (0.0=disabled)
-        spread_pips: Spread cost per trade in pips
+                      (applied via `SniperAgent.predict`, does not change env mechanics)
 
     Returns:
         BacktestResult with all metrics and trades
     """
-    logger.info("Starting backtest...")
+    logger.info("Starting backtest (1:1 TradingEnv execution)...")
 
     # Calculate backtest coverage
     if start_idx is None:
@@ -424,21 +417,9 @@ def run_backtest(
     bar_minutes = 5  # Base timeframe is 5 minutes
     logger.info(f"Backtest coverage: start_idx={start_idx}, max_steps={max_steps} "
                 f"({max_steps * bar_minutes / 60 / 24:.1f} days of 5m data)")
-    logger.info(f"Risk Management: SL={sl_atr_multiplier}x ATR (enabled={use_stop_loss}), "
-                f"TP={tp_atr_multiplier}x ATR (enabled={use_take_profit})")
-    
+
     if min_action_confidence > 0.0:
         logger.info(f"Confidence Threshold: {min_action_confidence:.2f}")
-
-    backtester = Backtester(
-        initial_balance=initial_balance,
-        pip_value=getattr(env, 'pip_value', 1.0),
-        sl_atr_multiplier=sl_atr_multiplier,
-        tp_atr_multiplier=tp_atr_multiplier,
-        use_stop_loss=use_stop_loss,
-        use_take_profit=use_take_profit
-    )
-    backtester.reset()
 
     # Temporarily override env.max_steps for full test coverage
     original_max_steps = env.max_steps
@@ -449,6 +430,34 @@ def run_backtest(
     done = False
     truncated = False
     step = 0
+
+    # Track a real "account balance" that matches TradingEnv costs and realized PnL.
+    # TradingEnv's `total_pnl` is in (pips/points × size) and already includes entry costs,
+    # but not open-position unrealized PnL. Here we maintain:
+    #   balance = initial_balance + realized_pnl (including entry costs)
+    # and mark-to-market equity as:
+    #   equity = balance + env.prev_unrealized_pnl
+    balance = float(initial_balance)
+    equity_history: List[float] = [balance]
+    actions_history: List[np.ndarray] = []
+    positions_history: List[int] = []
+    trades: List[TradeRecord] = []
+
+    # Track current open trade timestamps to build TradeRecords with real times.
+    open_trade_entry_time: Optional[pd.Timestamp] = None
+
+    ts = getattr(env, 'timestamps', None)
+    if ts is None:
+        raise ValueError(
+            "Backtest requires real timestamps (no synthetic timeline). "
+            "Pass a Unix-seconds `timestamps` array when creating `TradingEnv`."
+        )
+
+    def _bar_time(bar_idx: int) -> pd.Timestamp:
+        if not (0 <= bar_idx < len(ts)):
+            raise IndexError(f"bar_idx out of range for env.timestamps: {bar_idx} (len={len(ts)})")
+        # Stored as Unix seconds.
+        return pd.to_datetime(int(ts[bar_idx]), unit='s')
 
     while not done and not truncated:
         # Get action from agent
@@ -461,52 +470,102 @@ def run_backtest(
         # Step environment
         obs, reward, done, truncated, info = env.step(action)
 
-        # Get OHLC from environment
-        # env.current_idx points to NEXT step after env.step(), so current bar is at current_idx-1
+        # env.current_idx points to NEXT step after env.step(), so the processed bar is at current_idx-1
         bar_idx = env.current_idx - 1
 
-        # FIXED: Extract High/Low/Close for accurate intra-bar SL/TP detection
-        if hasattr(env, 'ohlc_data') and env.ohlc_data is not None:
-            # ohlc_data shape: (n_samples, 4) = [open, high, low, close]
-            high = float(env.ohlc_data[bar_idx, 1])
-            low = float(env.ohlc_data[bar_idx, 2])
-            close = float(env.ohlc_data[bar_idx, 3])
-        else:
-            # Fallback: use close price for all (legacy behavior)
-            close = env.close_prices[bar_idx]
-            high = close
-            low = close
+        # Record action and resulting position
+        actions_history.append(np.array(action, copy=True))
+        positions_history.append(int(getattr(env, 'position', 0)))
 
-        # Create timestamp (5-minute bars for synthetic timing)
-        time = pd.Timestamp.now() + pd.Timedelta(minutes=bar_minutes * step)
+        bar_time = _bar_time(bar_idx)
 
-        # Get ATR from environment
-        atr = 0.001
-        if hasattr(env, 'market_features') and len(env.market_features.shape) > 1:
-            atr = env.market_features[bar_idx, 0]
+        # IMPORTANT: Match TradingEnv ordering: closes happen before opens on reversals.
+        # 1) If a trade closed this step, the env has appended it to `env.trades`.
+        if info.get('trade_closed', False):
+            env_trades = getattr(env, 'trades', None) or []
+            last_trade = env_trades[-1] if env_trades else {}
 
-        # Step backtester with high/low/close for accurate SL/TP detection
-        backtester.step(action, high, low, close, time, atr=atr, spread_pips=spread_pips)
+            pnl = float(last_trade.get('pnl', info.get('pnl', 0.0)))
+            entry_price = float(last_trade.get('entry', np.nan))
+            exit_price = float(last_trade.get('exit', np.nan))
+            direction = int(last_trade.get('direction', 0))
+            size = float(last_trade.get('size', 0.0))
+
+            entry_time = open_trade_entry_time or bar_time
+            pnl_percent = (pnl / balance) * 100.0 if balance != 0.0 else 0.0
+
+            trades.append(TradeRecord(
+                entry_time=entry_time,
+                exit_time=bar_time,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                direction=direction,
+                size=size,
+                pnl_pips=pnl,
+                pnl_percent=pnl_percent
+            ))
+
+            balance += pnl
+            open_trade_entry_time = None
+
+        # 2) If a trade opened this step, apply execution costs immediately (same as env).
+        if info.get('trade_opened', False):
+            size = float(getattr(env, 'position_size', 0.0))
+            exec_cost = float(getattr(env, 'spread_pips', 0.0) + getattr(env, 'slippage_pips', 0.0)) * size
+            balance -= exec_cost
+            open_trade_entry_time = bar_time
+
+        # Mark-to-market equity at the close of the processed bar.
+        unrealized = float(getattr(env, 'prev_unrealized_pnl', 0.0))
+        equity_history.append(balance + unrealized)
 
         step += 1
 
         if step % 1000 == 0:
-            logger.info(f"Backtest step {step}, Balance: ${backtester.balance:.2f}")
+            logger.info(f"Backtest step {step}, Equity: ${equity_history[-1]:.2f}")
 
-    # Close any remaining position at the end
-    if backtester.position != 0:
-        final_price = env.close_prices[env.current_idx - 1]
-        final_time = pd.Timestamp.now() + pd.Timedelta(minutes=bar_minutes * step)
-        backtester._close_position(final_price, final_time)
-        backtester.equity_history[-1] = backtester.balance
+    # If we end with an open position, realize it at the last processed close (no extra exit costs in TradingEnv).
+    # This keeps final equity unchanged (it was already mark-to-market), but records the trade for metrics.
+    if int(getattr(env, 'position', 0)) != 0 and open_trade_entry_time is not None:
+        final_bar_idx = max(0, int(getattr(env, 'current_idx', 1)) - 1)
+        final_time = _bar_time(final_bar_idx)
+        final_price = float(env.close_prices[final_bar_idx])
+        direction = int(getattr(env, 'position', 0))
+        size = float(getattr(env, 'position_size', 0.0))
+        entry_price = float(getattr(env, 'entry_price', np.nan))
+
+        # Use env's last unrealized value at the last processed bar.
+        pnl = float(getattr(env, 'prev_unrealized_pnl', 0.0))
+        pnl_percent = (pnl / balance) * 100.0 if balance != 0.0 else 0.0
+
+        trades.append(TradeRecord(
+            entry_time=open_trade_entry_time,
+            exit_time=final_time,
+            entry_price=entry_price,
+            exit_price=final_price,
+            direction=direction,
+            size=size,
+            pnl_pips=pnl,
+            pnl_percent=pnl_percent
+        ))
+        balance += pnl
+        open_trade_entry_time = None
 
     # Restore original max_steps
     env.max_steps = original_max_steps
 
-    results = backtester.get_results()
-    logger.info(f"Backtest complete. {len(results.trades)} trades, "
-                f"Final balance: ${results.equity_curve[-1]:.2f}")
+    equity_curve = np.asarray(equity_history, dtype=np.float32)
+    metrics = calculate_metrics(equity_curve, trades, initial_balance)
+    results = BacktestResult(
+        equity_curve=equity_curve,
+        trades=trades,
+        metrics=metrics,
+        actions=np.asarray(actions_history),
+        positions=np.asarray(positions_history),
+        timestamps=getattr(env, 'timestamps', None)
+    )
 
+    logger.info(f"Backtest complete. {len(results.trades)} trades, Final equity: ${results.equity_curve[-1]:.2f}")
     return results
 
 

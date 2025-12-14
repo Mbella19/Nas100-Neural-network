@@ -597,7 +597,34 @@ def step_6_backtest(
     
     # Use last 15% for testing
     test_start = int(0.85 * len(close_prices))
-    
+
+    # ------------------------------------------------------------------
+    # Provide real OHLC + timestamps to the env so SL/TP intra-bar logic
+    # matches PPO training (which uses high/low wicks when available).
+    # ------------------------------------------------------------------
+    subsample_15m = 3
+    subsample_45m = 9
+    start_idx = max(
+        lookback_5m,
+        (lookback_15m - 1) * subsample_15m + 1,
+        (lookback_45m - 1) * subsample_45m + 1,
+    )
+    n_samples = len(close_prices)
+
+    ohlc_data = None
+    timestamps = None
+    if all(col in df_5m.columns for col in ['open', 'high', 'low', 'close']):
+        ohlc_data = (
+            df_5m[['open', 'high', 'low', 'close']]
+            .values[start_idx:start_idx + n_samples]
+            .astype(np.float32)
+        )
+    if df_5m.index.dtype == 'datetime64[ns]' or hasattr(df_5m.index, 'to_pydatetime'):
+        try:
+            timestamps = (df_5m.index[start_idx:start_idx + n_samples].astype('int64') // 10**9).values
+        except Exception as e:
+            logger.warning(f"Failed to extract timestamps for backtest: {e}")
+
     # CRITICAL FIX: Compute market feature normalization stats from TRAINING data only
     # This prevents look-ahead bias in the test backtest
     train_market_features = market_features[:test_start]
@@ -620,6 +647,8 @@ def step_6_backtest(
 
     # Returns for "Full Eyes"
     test_returns = returns[test_start:] if returns is not None else None
+    test_ohlc = ohlc_data[test_start:] if ohlc_data is not None else None
+    test_timestamps = timestamps[test_start:] if timestamps is not None else None
 
     # Create test environment with TRAINING stats (prevents look-ahead bias)
     # FIX: Disable noise for backtesting (evaluation must be on clean data)
@@ -633,7 +662,9 @@ def step_6_backtest(
         device=device,
         market_feat_mean=market_feat_mean,
         market_feat_std=market_feat_std,
-        returns=test_returns
+        returns=test_returns,
+        ohlc_data=test_ohlc,
+        timestamps=test_timestamps,
     )
 
     # Load agent
@@ -641,19 +672,21 @@ def step_6_backtest(
     test_env = Monitor(test_env)
     agent = SniperAgent.load(str(agent_path), test_env, device='cpu')
 
+    initial_balance = float(getattr(test_config, 'initial_balance', 10000.0))
+
     # Run backtest
     results = run_backtest(
         agent=agent,
         env=test_env.unwrapped,
         min_action_confidence=min_action_confidence,
-        spread_pips=config.trading.spread_pips + config.trading.slippage_pips
+        initial_balance=initial_balance,
     )
 
     # Compare with buy-and-hold
     comparison = compare_with_baseline(
         results,
         close_prices[test_start:],
-        initial_balance=10000.0
+        initial_balance=initial_balance,
     )
 
     # Print reports
