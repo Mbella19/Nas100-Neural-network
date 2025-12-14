@@ -239,7 +239,8 @@ class SniperAgent:
 
         # Add Checkpoint Callback (Save every 100k steps)
         if save_path:
-            checkpoint_path = Path(save_path).parent / "checkpoints"
+            checkpoint_path = Path(save_path) / "checkpoints"
+            checkpoint_path.mkdir(parents=True, exist_ok=True)
             callback_list.append(CheckpointCallback(
                 save_freq=100_000,
                 save_path=str(checkpoint_path),

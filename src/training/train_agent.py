@@ -37,6 +37,13 @@ from ..data.features import (
     detect_fractals,
     detect_structure_breaks
 )
+from ..data.microstructure import add_smc_microstructure_features
+from ..data.feature_names import (
+    SMC_FEATURE_COLUMNS,
+    AGENT_TF_BASE_FEATURE_COLUMNS,
+    AGENT_MARKET_FEATURE_COLUMNS,
+)
+from config.settings import SMCConfig
 
 # Visualization imports (optional, non-blocking)
 try:
@@ -262,9 +269,9 @@ class AgentTrainingLogger(BaseCallback):
                 if 'ohlc' in info and 'timestamp' in info['ohlc']:
                     current_bar_timestamp = info['ohlc']['timestamp']
                 else:
-                    # Fallback to synthetic timestamp
+                    # Fallback to synthetic timestamp (5-minute bars)
                     base_timestamp = 1700000000
-                    current_bar_timestamp = base_timestamp + (self.bar_counter * 900)
+                    current_bar_timestamp = base_timestamp + (self.bar_counter * 300)
 
                 # Emit trade events with proper timestamp
                 if info.get('trade_opened'):
@@ -295,7 +302,7 @@ class AgentTrainingLogger(BaseCallback):
                         # Use real OHLC from the trading data
                         real_ohlc = info['ohlc']
                         ohlc_data = {
-                            'timestamp': real_ohlc.get('timestamp', 1700000000 + (self.bar_counter * 900)),
+	                            'timestamp': real_ohlc.get('timestamp', 1700000000 + (self.bar_counter * 300)),
                             'open': real_ohlc['open'],
                             'high': real_ohlc['high'],
                             'low': real_ohlc['low'],
@@ -308,7 +315,7 @@ class AgentTrainingLogger(BaseCallback):
                         if current_price > 0:
                             prev_price = self._prev_price if self._prev_price > 0 else current_price
                             base_timestamp = 1700000000  # Nov 2023
-                            bar_timestamp = base_timestamp + (self.bar_counter * 900)
+                            bar_timestamp = base_timestamp + (self.bar_counter * 300)
                             ohlc_data = {
                                 'timestamp': bar_timestamp,
                                 'open': prev_price,
@@ -551,85 +558,167 @@ class AgentTrainingLogger(BaseCallback):
 
 
 def prepare_env_data(
+    df_5m,
     df_15m,
-    df_1h,
-    df_4h,
+    df_45m,
     feature_cols: list,
-    lookback_15m: int = 20,
-    lookback_1h: int = 24,
-    lookback_4h: int = 12
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    lookback_5m: int = 48,
+    lookback_15m: int = 16,
+    lookback_45m: int = 6,
+    component_sequences: Optional[np.ndarray] = None,
+    smc_cfg: Optional[SMCConfig] = None,
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+]:
     """
     Prepare windowed data for the trading environment.
     
-    FIXED: 1H and 4H data now correctly subsampled from the aligned 15m index.
-    Since df_1h and df_4h are aligned to the 15m index via forward-fill,
-    we subsample every 4th bar for 1H and every 16th bar for 4H.
+    FIXED: 15m and 45m data now correctly subsampled from the aligned 5m index.
+    Since df_15m and df_45m are aligned to the 5m index via forward-fill,
+    we subsample every 3rd bar for 15m and every 9th bar for 45m.
 
     Returns:
-        Tuple of (data_15m, data_1h, data_4h, close_prices, market_features)
+        Tuple of (data_5m, data_15m, data_45m, close_prices, market_features, component_data, returns)
     """
-    # Subsampling ratios: how many 15m bars per higher TF bar
-    subsample_1h = 4   # 4 x 15m = 1H
-    subsample_4h = 16  # 16 x 15m = 4H
+    # Subsampling ratios: how many 5m bars per higher TF bar
+    subsample_15m = 3   # 3 x 5m = 15m
+    subsample_45m = 9   # 9 x 5m = 45m
     
-    # Calculate valid range - need enough indices for subsampled lookback
-    start_idx = max(lookback_15m, lookback_1h * subsample_1h, lookback_4h * subsample_4h)
-    n_samples = len(df_15m) - start_idx - 1
+    # Calculate valid range accounting for subsampling.
+    # Need enough bars for: 5m lookback, (15m lookback-1)*3+1, (45m lookback-1)*9+1.
+    # This matches `src/training/precompute_analyst.py` and avoids dropping extra valid samples.
+    start_idx = max(
+        lookback_5m,
+        (lookback_15m - 1) * subsample_15m + 1,
+        (lookback_45m - 1) * subsample_45m + 1,
+    )
+    n_samples = len(df_5m) - start_idx
 
     logger.info(f"Preparing {n_samples} samples for environment")
-    logger.info(f"  15m: {lookback_15m} bars = {lookback_15m * 15 / 60:.1f} hours")
-    logger.info(f"  1H: {lookback_1h} bars = {lookback_1h} hours (using {lookback_1h * subsample_1h} aligned indices)")
-    logger.info(f"  4H: {lookback_4h} bars = {lookback_4h * 4} hours (using {lookback_4h * subsample_4h} aligned indices)")
+    logger.info(f"  5m: {lookback_5m} bars = {lookback_5m * 5 / 60:.1f} hours")
+    logger.info(f"  15m: {lookback_15m} bars = {lookback_15m * 15 / 60:.1f} hours (using {(lookback_15m - 1) * subsample_15m + 1} aligned indices)")
+    logger.info(f"  45m: {lookback_45m} bars = {lookback_45m * 45 / 60:.1f} hours (using {(lookback_45m - 1) * subsample_45m + 1} aligned indices)")
 
     # Prepare windowed data
+    data_5m = np.zeros((n_samples, lookback_5m, len(feature_cols)), dtype=np.float32)
     data_15m = np.zeros((n_samples, lookback_15m, len(feature_cols)), dtype=np.float32)
-    data_1h = np.zeros((n_samples, lookback_1h, len(feature_cols)), dtype=np.float32)
-    data_4h = np.zeros((n_samples, lookback_4h, len(feature_cols)), dtype=np.float32)
+    data_45m = np.zeros((n_samples, lookback_45m, len(feature_cols)), dtype=np.float32)
 
+    features_5m = df_5m[feature_cols].values.astype(np.float32)
     features_15m = df_15m[feature_cols].values.astype(np.float32)
-    features_1h = df_1h[feature_cols].values.astype(np.float32)
-    features_4h = df_4h[feature_cols].values.astype(np.float32)
+    features_45m = df_45m[feature_cols].values.astype(np.float32)
 
     for i in range(n_samples):
         actual_idx = start_idx + i
-        # 15m: direct indexing (include current candle)
-        data_15m[i] = features_15m[actual_idx - lookback_15m + 1:actual_idx + 1]
+        # 5m: direct indexing (include current candle)
+        data_5m[i] = features_5m[actual_idx - lookback_5m + 1:actual_idx + 1]
 
-        # FIXED: 1H - subsample every 4th bar from aligned data, INCLUDING current candle
+        # FIXED: 15m - subsample every 3rd bar from aligned data, INCLUDING current candle
         # range() is exclusive at end, so we use actual_idx + 1 to include current
-        idx_range_1h = list(range(
-            actual_idx - (lookback_1h - 1) * subsample_1h,
+        idx_range_15m = list(range(
+            actual_idx - (lookback_15m - 1) * subsample_15m,
             actual_idx + 1,
-            subsample_1h
+            subsample_15m
         ))
-        data_1h[i] = features_1h[idx_range_1h]
+        data_15m[i] = features_15m[idx_range_15m]
 
-        # FIXED: 4H - subsample every 16th bar from aligned data, INCLUDING current candle
-        idx_range_4h = list(range(
-            actual_idx - (lookback_4h - 1) * subsample_4h,
+        # FIXED: 45m - subsample every 9th bar from aligned data, INCLUDING current candle
+        idx_range_45m = list(range(
+            actual_idx - (lookback_45m - 1) * subsample_45m,
             actual_idx + 1,
-            subsample_4h
+            subsample_45m
         ))
-        data_4h[i] = features_4h[idx_range_4h]
+        data_45m[i] = features_45m[idx_range_45m]
 
     # Close prices
-    close_prices = df_15m['close'].values[start_idx:start_idx + n_samples].astype(np.float32)
+    close_prices = df_5m['close'].values[start_idx:start_idx + n_samples].astype(np.float32)
+    
+    # Returns (for "Full Eyes" agent peripheral vision)
+    # Using 'returns' column if available, else derive from prices
+    if 'returns' in df_5m.columns:
+        returns = df_5m['returns'].values[start_idx:start_idx + n_samples].astype(np.float32)
+    else:
+        # Calculate returns on the fly
+        ret = df_5m['close'].pct_change().fillna(0).values
+        returns = ret[start_idx:start_idx + n_samples].astype(np.float32)
+
+    # ------------------------------------------------------------------
+    # Agent-only microstructure (SMC) + multi-timeframe visibility
+    # ------------------------------------------------------------------
+    if smc_cfg is None:
+        smc_cfg = SMCConfig()
+    include_higher_tfs = bool(getattr(smc_cfg, "include_higher_timeframes", True))
+
+    # 5m SMC (always computed/available in the main pipeline; compute as fallback)
+    try:
+        missing_5m = [c for c in SMC_FEATURE_COLUMNS if c not in df_5m.columns]
+        if missing_5m:
+            logger.info(f"Computing SMC microstructure features for 5m (missing {len(missing_5m)})...")
+            add_smc_microstructure_features(df_5m, smc_cfg.for_timeframe_minutes(5), inplace=True)
+    except Exception as e:
+        logger.warning(f"Failed to compute 5m SMC features; filling zeros: {e}")
+
+    if include_higher_tfs:
+        # 15m/45m SMC: these SHOULD be computed on native TF before alignment in the pipeline.
+        # If missing, we fall back to computing on the aligned series (less ideal, but keeps training runnable).
+        for tf_name, df_tf in (("15m", df_15m), ("45m", df_45m)):
+            try:
+                missing_tf = [c for c in SMC_FEATURE_COLUMNS if c not in df_tf.columns]
+                if missing_tf:
+                    logger.info(f"Computing SMC microstructure features for {tf_name} (missing {len(missing_tf)})...")
+                    tf_minutes = 15 if tf_name == "15m" else 45
+                    add_smc_microstructure_features(df_tf, smc_cfg.for_timeframe_minutes(tf_minutes), inplace=True)
+            except Exception as e:
+                logger.warning(f"Failed to compute {tf_name} SMC features; filling zeros: {e}")
+
+    # Copy 15m/45m base+SMC features onto df_5m with suffixes so the env observes them.
+    if include_higher_tfs:
+        tf_copy_cols = list(AGENT_TF_BASE_FEATURE_COLUMNS) + list(SMC_FEATURE_COLUMNS)
+        for tf_name, df_tf in (("15m", df_15m), ("45m", df_45m)):
+            # Only add columns that are not already present on the 5m frame.
+            cols_to_add = [c for c in tf_copy_cols if f"{c}_{tf_name}" not in df_5m.columns]
+            if not cols_to_add:
+                continue
+            for col in cols_to_add:
+                if col not in df_tf.columns:
+                    df_tf[col] = 0.0
+            df_5m = df_5m.join(df_tf[cols_to_add].add_suffix(f"_{tf_name}"), how="left")
 
     # Market features for reward shaping (includes S/R for breakout vs chase detection)
-    market_cols = ['atr', 'chop', 'adx', 'regime', 'sma_distance', 'dist_to_support', 'dist_to_resistance']
-    available_cols = [c for c in market_cols if c in df_15m.columns]
+    market_cols = list(AGENT_MARKET_FEATURE_COLUMNS)
+    for col in market_cols:
+        if col not in df_5m.columns:
+            df_5m[col] = 0.0
 
-    if len(available_cols) > 0:
-        market_features = df_15m[available_cols].values[start_idx:start_idx + n_samples].astype(np.float32)
-    else:
-        # Create dummy features if not available
-        market_features = np.zeros((n_samples, 5), dtype=np.float32)
-        market_features[:, 0] = 0.001  # Default ATR
-        market_features[:, 1] = 50.0   # Default CHOP
-        market_features[:, 2] = 20.0   # Default ADX
+    # Ensure no NaNs reach the environment (NaNs can crash SB3 / destabilize PPO).
+    df_5m[market_cols] = df_5m[market_cols].fillna(0.0).astype(np.float32)
 
-    return data_15m, data_1h, data_4h, close_prices, market_features
+    market_features = df_5m[market_cols].values[start_idx:start_idx + n_samples].astype(np.float32)
+
+    # Component data (optional, already windowed per index)
+    component_data = None
+    if component_sequences is not None:
+        try:
+            if component_sequences.shape[0] == len(df_5m):
+                component_data = component_sequences[start_idx:start_idx + n_samples].astype(np.float32)
+            else:
+                logger.warning(
+                    f"Component sequences length mismatch ({component_sequences.shape[0]} vs {len(df_5m)}); "
+                    "ignoring component data."
+                )
+        except Exception as e:
+            logger.warning(f"Failed to trim component sequences: {e}")
+            component_data = None
+
+            component_data = None
+            
+    return data_5m, data_15m, data_45m, close_prices, market_features, component_data, returns
 
 
 def create_trading_env(
@@ -638,6 +727,7 @@ def create_trading_env(
     data_4h: np.ndarray,
     close_prices: np.ndarray,
     market_features: np.ndarray,
+    component_data: Optional[np.ndarray] = None,
     analyst_model: Optional[MarketAnalyst] = None,
     config: Optional[object] = None,
     device: Optional[torch.device] = None,
@@ -648,6 +738,7 @@ def create_trading_env(
     precomputed_analyst_cache: Optional[dict] = None,  # Pre-computed Analyst outputs
     ohlc_data: Optional[np.ndarray] = None,         # Real OHLC for visualization
     timestamps: Optional[np.ndarray] = None,        # Real timestamps for visualization
+    returns: Optional[np.ndarray] = None,           # Returns for Full Eyes
 ) -> TradingEnv:
     """
     Create the trading environment.
@@ -656,6 +747,7 @@ def create_trading_env(
         data_*: Prepared window data
         close_prices: Close prices for PnL
         market_features: Features for reward shaping
+        component_data: Optional component windows aligned to data_* samples
         analyst_model: Frozen Market Analyst
         config: TradingConfig
         device: Torch device
@@ -676,6 +768,7 @@ def create_trading_env(
     reward_scaling = 0.1    # 1.0 reward per 1 pip (safe after fixing unit bugs)
     context_dim = 64
     trade_entry_bonus = 0.01  # Moderate bonus (~half of entry cost)
+    noise_level = 0.0         # Default: no observation noise unless configured
 
     # Risk Management defaults
     sl_atr_multiplier = 1.0
@@ -713,11 +806,12 @@ def create_trading_env(
         enforce_analyst_alignment = getattr(trading_cfg, 'enforce_analyst_alignment', enforce_analyst_alignment)
         # v15: Trade entry bonus
         trade_entry_bonus = getattr(trading_cfg, 'trade_entry_bonus', trade_entry_bonus)
+        noise_level = getattr(trading_cfg, 'noise_level', noise_level)
 
         # Log config values to verify they're applied
         logger.info(f"Config applied: fomo_penalty={fomo_penalty}, reward_scaling={reward_scaling}, "
                     f"slippage_pips={slippage_pips}, trade_entry_bonus={trade_entry_bonus}, "
-                    f"enforce_analyst_alignment={enforce_analyst_alignment}")
+                    f"enforce_analyst_alignment={enforce_analyst_alignment}, noise_level={noise_level}")
 
     if analyst_model is not None:
         context_dim = analyst_model.context_dim
@@ -727,11 +821,13 @@ def create_trading_env(
         num_classes = 2  # Default to binary
 
     env = TradingEnv(
-        data_15m=data_15m,
-        data_1h=data_1h,
-        data_4h=data_4h,
+        # Map legacy arg names to TradingEnv signature
+        data_5m=data_15m,
+        data_15m=data_1h,
+        data_45m=data_4h,
         close_prices=close_prices,
         market_features=market_features,
+        component_data=component_data,
         analyst_model=analyst_model,
         context_dim=context_dim,
         spread_pips=spread_pips,
@@ -744,7 +840,7 @@ def create_trading_env(
         reward_scaling=reward_scaling,  # v15 FIX: Use local variable, not config directly
         trade_entry_bonus=trade_entry_bonus,  # v15: Exploration bonus
         device=device,
-        noise_level=getattr(config, 'noise_level', 0.01) if config else 0.0,
+        noise_level=noise_level,
         market_feat_mean=market_feat_mean,
         market_feat_std=market_feat_std,
         # Risk Management
@@ -767,6 +863,10 @@ def create_trading_env(
         # Visualization data
         ohlc_data=ohlc_data,
         timestamps=timestamps,
+        # Full Eyes Features
+        returns=returns,
+        agent_lookback_window=getattr(trading_cfg, 'agent_lookback_window', 6) if config is not None else 6,
+        include_attention_features=getattr(trading_cfg, 'include_attention_features', False) if config is not None else False,
     )
 
     return env
@@ -779,6 +879,7 @@ def train_agent(
     feature_cols: list,
     analyst_path: str,
     save_path: str,
+    component_sequences: Optional[np.ndarray] = None,
     config: Optional[object] = None,
     device: Optional[torch.device] = None,
     total_timesteps: int = 500_000,
@@ -796,6 +897,7 @@ def train_agent(
         save_path: Path to save agent
         config: Configuration object
         device: Torch device
+        component_sequences: Optional precomputed component windows aligned to df_15m index
         total_timesteps: Total training timesteps
 
     Returns:
@@ -824,13 +926,15 @@ def train_agent(
         'dist_to_resistance', 'dist_to_support',
         # Extra features added during training
         'session_asian', 'session_london', 'session_ny',
-        'bos_bullish', 'bos_bearish', 'choch_bullish', 'choch_bearish'
+        'bos_bullish', 'bos_bearish', 'choch_bullish', 'choch_bearish',
+        'top6_momentum', 'top6_dispersion'
     ]
     
+    # TCNAnalyst expects true timeframe keys in this system
     feature_dims = {
+        '5m': len(model_features),
         '15m': len(model_features),
-        '1h': len(model_features),
-        '4h': len(model_features)
+        '45m': len(model_features)
     }
     analyst = load_analyst(analyst_path, feature_dims, device, freeze=True)
     logger.info("Analyst loaded and frozen")
@@ -856,31 +960,83 @@ def train_agent(
         for col in struct_df.columns:
             df[col] = struct_df[col]
 
-    # Update feature columns if not already included
-    session_cols = ['session_asian', 'session_london', 'session_ny']
-    struct_cols = ['bos_bullish', 'bos_bearish', 'choch_bullish', 'choch_bearish']
-    
-    for col in session_cols + struct_cols:
-        if col not in feature_cols:
-            feature_cols.append(col)
+    # NOTE: Do NOT append session/structure columns to `feature_cols` here.
+    # `feature_cols` must match what the Analyst checkpoint was trained on.
+    # Session/structure columns can still be used by the agent via `market_features`
+    # (see `prepare_env_data()`).
 
+    # NOTE: We now operate on 5m/15m/45m timeframes.
+    # train_agent() keeps legacy arg names (df_15m/df_1h/df_4h) for compatibility,
+    # but the mapping in the pipeline is:
+    #   df_15m -> 5m base
+    #   df_1h  -> 15m mid
+    #   df_4h  -> 45m high
+    lookback_5m = config.analyst.lookback_5m
     lookback_15m = config.analyst.lookback_15m
-    lookback_1h = config.analyst.lookback_1h
-    lookback_4h = config.analyst.lookback_4h
+    lookback_45m = config.analyst.lookback_45m
 
-    data_15m, data_1h, data_4h, close_prices, market_features = prepare_env_data(
+    seq_path = getattr(config.paths, 'component_sequences', None) if config is not None else None
+
+    # Load component sequences from disk if not provided
+    if component_sequences is None and config is not None:
+        if getattr(config.analyst, 'use_cross_asset_attention', False) and seq_path is not None and Path(seq_path).exists():
+            try:
+                from ..data.components import load_component_sequences
+                component_sequences, _ = load_component_sequences(seq_path)
+            except Exception as e:
+                logger.warning(f"Failed to load component sequences for agent training: {e}")
+                component_sequences = None
+
+    # Validate/rebuild component sequences if feature dimensions changed
+    if (
+        config is not None and
+        getattr(config.analyst, 'use_cross_asset_attention', False) and
+        component_sequences is not None
+    ):
+        expected_seq_len = getattr(config.analyst, 'component_seq_len', 12)
+        expected_input_dim = getattr(config.analyst, 'component_input_dim', 4)
+        if (
+            component_sequences.ndim != 4 or
+            component_sequences.shape[0] != len(df_15m) or
+            component_sequences.shape[2] != expected_seq_len or
+            component_sequences.shape[3] != expected_input_dim
+        ):
+            logger.info("Existing component sequences mismatch; recomputing...")
+            try:
+                from ..data.components import prepare_component_sequences, save_component_sequences
+
+                resample_rule = config.data.timeframes.get('5m', '5min')
+                component_sequences = prepare_component_sequences(
+                    config.paths.components_dir,
+                    df_15m.index,
+                    resample_rule=resample_rule,
+                    seq_len=expected_seq_len
+                )
+                if component_sequences is not None and seq_path is not None:
+                    save_component_sequences(component_sequences, seq_path)
+            except Exception as e:
+                logger.warning(f"Failed to recompute component sequences: {e}")
+                component_sequences = None
+
+    data_15m, data_1h, data_4h, close_prices, market_features, component_data, returns = prepare_env_data(
         df_15m, df_1h, df_4h, feature_cols,
-        lookback_15m, lookback_1h, lookback_4h
+        lookback_5m, lookback_15m, lookback_45m,
+        component_sequences=component_sequences,
+        smc_cfg=getattr(config, "smc", None) if config is not None else None,
     )
 
     logger.info(f"Data shapes: 15m={data_15m.shape}, 1h={data_1h.shape}, 4h={data_4h.shape}")
     logger.info(f"Price range: {close_prices.min():.5f} - {close_prices.max():.5f}")
 
     # Extract real OHLC data for visualization
-    # Calculate start_idx to match prepare_env_data
-    subsample_1h = 4
-    subsample_4h = 16
-    start_idx = max(lookback_15m, lookback_1h * subsample_1h, lookback_4h * subsample_4h)
+    # Calculate start_idx to match prepare_env_data (5m base with 15m/45m subsampling)
+    subsample_15m = 3
+    subsample_45m = 9
+    start_idx = max(
+        lookback_5m,
+        (lookback_15m - 1) * subsample_15m + 1,
+        (lookback_45m - 1) * subsample_45m + 1,
+    )
     n_samples = len(close_prices)
     
     ohlc_data = None
@@ -906,7 +1062,9 @@ def train_agent(
         data_1h[:split_idx],
         data_4h[:split_idx],
         close_prices[:split_idx],
-        market_features[:split_idx]
+        market_features[:split_idx],
+        component_data[:split_idx] if component_data is not None else None,
+        returns[:split_idx] if returns is not None else None,
     )
 
     eval_data = (
@@ -914,7 +1072,9 @@ def train_agent(
         data_1h[split_idx:],
         data_4h[split_idx:],
         close_prices[split_idx:],
-        market_features[split_idx:]
+        market_features[split_idx:],
+        component_data[split_idx:] if component_data is not None else None,
+        returns[split_idx:] if returns is not None else None,
     )
 
     # Split OHLC data for train/eval
@@ -937,7 +1097,9 @@ def train_agent(
     # Compute regime labels for balanced sampling (training data only)
     # This ensures agent learns from BULLISH, BEARISH, and RANGING markets equally
     logger.info("Computing regime labels for balanced sampling...")
-    train_regime_labels = compute_regime_labels(df_15m.iloc[:split_idx], lookback=20)
+    # Align regime labels to the same trimmed segment used by the environment.
+    env_df_5m = df_15m.iloc[start_idx:start_idx + n_samples]
+    train_regime_labels = compute_regime_labels(env_df_5m.iloc[:split_idx], lookback=20)
     regime_counts = {
         'Bullish': (train_regime_labels == 0).sum(),
         'Ranging': (train_regime_labels == 1).sum(),
@@ -995,24 +1157,36 @@ def train_agent(
         viz_timestamps = None
 
     train_env = create_trading_env(
-        *train_data,
+        data_15m=train_data[0],
+        data_1h=train_data[1],
+        data_4h=train_data[2],
+        close_prices=train_data[3],
+        market_features=train_data[4],
+        component_data=train_data[5],
+        returns=train_data[6], # Pass returns
         analyst_model=analyst,
-        config=config.trading,
+        config=config,
         device=device,
         market_feat_mean=market_feat_mean,
         market_feat_std=market_feat_std,
-        regime_labels=train_regime_labels,  # Enable regime-balanced sampling
+        regime_labels=train_regime_labels,
         use_regime_sampling=use_regime_sampling_train,
-        precomputed_analyst_cache=train_analyst_cache,  # Use sequential context if available
-        ohlc_data=train_ohlc,          # Real OHLC for visualization
-        timestamps=viz_timestamps,    # Use synthetic timestamps if regime sampling
+        precomputed_analyst_cache=train_analyst_cache,
+        ohlc_data=train_ohlc,
+        timestamps=viz_timestamps,
     )
 
     logger.info("Creating evaluation environment...")
     eval_env = create_trading_env(
-        *eval_data,
+        data_15m=eval_data[0],
+        data_1h=eval_data[1],
+        data_4h=eval_data[2],
+        close_prices=eval_data[3],
+        market_features=eval_data[4],
+        component_data=eval_data[5],
+        returns=eval_data[6], # Pass returns
         analyst_model=analyst,
-        config=config.trading,
+        config=config,
         device=device,
         market_feat_mean=market_feat_mean,  # Use TRAINING stats for eval too
         market_feat_std=market_feat_std,
@@ -1035,9 +1209,37 @@ def train_agent(
     reset_timesteps = True
     remaining_timesteps = total_timesteps
 
-    if resume_path and Path(resume_path).exists():
-        logger.info(f"Resuming PPO agent from checkpoint: {resume_path}")
-        agent = SniperAgent.load(resume_path, env=train_env, device=device)
+    if resume_path:
+        resume_p = Path(str(resume_path)).expanduser()
+        if not resume_p.is_file():
+            raise FileNotFoundError(
+                f"Resume checkpoint not found (or not a file): {resume_p}\n"
+                "Expected a SB3 .zip checkpoint like: models/checkpoints/sniper_model_7400000_steps.zip"
+            )
+
+        logger.info(f"Resuming PPO agent from checkpoint: {resume_p}")
+        try:
+            agent = SniperAgent.load(str(resume_p), env=train_env, device=device)
+        except Exception as e:
+            logger.error(
+                "Failed to resume PPO from checkpoint. Most common causes:\n"
+                "- Observation space changed (e.g. added/removed features, changed `agent_lookback_window`, "
+                "`include_attention_features`, or market feature columns)\n"
+                "- Action space changed\n"
+                f"Checkpoint: {resume_p}\n"
+                f"Env obs shape: {getattr(train_env.observation_space, 'shape', None)}\n"
+                f"Env action space: {train_env.action_space}\n"
+                f"Error: {e}"
+            )
+            raise
+        
+        # Force-update Exploration Rate (Entropy Coefficient) from current config
+        # This allows "shock therapy" (increasing exploration) on resumed models
+        if hasattr(config.agent, 'ent_coef'):
+            current_ent_coef = getattr(agent.model, 'ent_coef', None)
+            new_ent_coef = config.agent.ent_coef
+            agent.model.ent_coef = new_ent_coef
+            logger.info(f"Exploration Rate (Entropy) UPDATED: {current_ent_coef} -> {new_ent_coef}")
         
         # Calculate remaining steps
         current_timesteps = agent.model.num_timesteps
@@ -1152,11 +1354,11 @@ def load_and_evaluate(
     logger.info(f"Evaluating on {n_episodes} episodes")
 
     # Load analyst
-    feature_dims = {'15m': len(feature_cols), '1h': len(feature_cols), '4h': len(feature_cols)}
+    feature_dims = {'5m': len(feature_cols), '15m': len(feature_cols), '45m': len(feature_cols)}
     analyst = load_analyst(analyst_path, feature_dims, device, freeze=True)
 
     # Prepare data (use last portion as test)
-    data_15m, data_1h, data_4h, close_prices, market_features = prepare_env_data(
+    data_15m, data_1h, data_4h, close_prices, market_features, component_data, returns = prepare_env_data(
         df_15m, df_1h, df_4h, feature_cols
     )
 
@@ -1167,11 +1369,13 @@ def load_and_evaluate(
         data_1h[test_start:],
         data_4h[test_start:],
         close_prices[test_start:],
-        market_features[test_start:]
+        market_features[test_start:],
+        component_data[test_start:] if component_data is not None else None,
     )
+    test_returns = returns[test_start:] if returns is not None else None
 
     # Create test environment
-    test_env = create_trading_env(*test_data, analyst_model=analyst, device=device)
+    test_env = create_trading_env(*test_data, analyst_model=analyst, device=device, returns=test_returns)
     test_env = Monitor(test_env)
 
     # Load agent

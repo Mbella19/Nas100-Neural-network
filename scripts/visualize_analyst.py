@@ -32,7 +32,8 @@ sys.path.insert(0, str(project_root))
 
 from config.settings import Config, get_device
 from src.models.analyst import load_analyst
-from src.data.features import add_market_sessions, detect_fractals, detect_structure_breaks
+from src.data.features import get_feature_columns
+from src.data.components import load_component_sequences
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -64,6 +65,7 @@ class SimulationState:
         self.device = None
         self.lookbacks = {}
         self.feature_cols = []
+        self.component_sequences = None
 
 state = SimulationState()
 
@@ -76,33 +78,33 @@ def prepare_data():
     # 1. Load Data
     logger.info("Loading data...")
     try:
-        # Load normalized data for model
+        # Load normalized data for model (aligned 5m/15m/45m dataset)
+        df_5m = pd.read_parquet(config.paths.data_processed / 'features_5m_normalized.parquet')
         df_15m = pd.read_parquet(config.paths.data_processed / 'features_15m_normalized.parquet')
-        df_1h = pd.read_parquet(config.paths.data_processed / 'features_1h_normalized.parquet')
-        df_4h = pd.read_parquet(config.paths.data_processed / 'features_4h_normalized.parquet')
-        
+        df_45m = pd.read_parquet(config.paths.data_processed / 'features_45m_normalized.parquet')
+
         # Load raw data for visualization (prices)
-        df_15m_raw = pd.read_parquet(config.paths.data_processed / 'features_15m.parquet')
+        df_5m_raw = pd.read_parquet(config.paths.data_processed / 'features_5m.parquet')
     except FileNotFoundError:
         logger.error("Processed data not found. Run pipeline first.")
         sys.exit(1)
 
-    # 2. Filter last 30 days (approx 4*24*30 = 2880 bars)
+    # 2. Filter last 30 days (5-minute bars: 12*24 per day)
     days_to_visualize = 30
-    bars_15m = 4 * 24 * days_to_visualize
+    bars_5m = 12 * 24 * days_to_visualize
     
     # Ensure we have enough data
-    if len(df_15m) < bars_15m:
+    if len(df_5m) < bars_5m:
         logger.warning(f"Not enough data for {days_to_visualize} days. Using all available.")
         start_idx = 0
     else:
-        start_idx = len(df_15m) - bars_15m
+        start_idx = len(df_5m) - bars_5m
 
     # Align all dataframes
+    df_5m = df_5m.iloc[start_idx:].reset_index(drop=True)
+    df_5m_raw = df_5m_raw.iloc[start_idx:].reset_index(drop=True)  # Align raw data
     df_15m = df_15m.iloc[start_idx:].reset_index(drop=True)
-    df_15m_raw = df_15m_raw.iloc[start_idx:].reset_index(drop=True) # Align raw data
-    df_1h = df_1h.iloc[-len(df_15m):].reset_index(drop=True)
-    df_4h = df_4h.iloc[-len(df_15m):].reset_index(drop=True)
+    df_45m = df_45m.iloc[start_idx:].reset_index(drop=True)
 
     # 3. Load Model
     analyst_path = config.paths.models_analyst / 'best.pt'
@@ -111,20 +113,14 @@ def prepare_data():
         sys.exit(1)
 
     # Define features (must match training)
-    feature_cols = [
-        'returns', 'volatility', 'pinbar', 'engulfing', 'doji',
-        'ema_trend', 'ema_crossover', 'regime', 'sma_distance',
-        'dist_to_resistance', 'dist_to_support',
-        'session_asian', 'session_london', 'session_ny',
-        'bos_bullish', 'bos_bearish', 'choch_bullish', 'choch_bearish'
-    ]
-    feature_cols = [c for c in feature_cols if c in df_15m.columns]
+    feature_cols = get_feature_columns()
+    feature_cols = [c for c in feature_cols if c in df_5m.columns]
     state.feature_cols = feature_cols
 
     feature_dims = {
+        '5m': len(feature_cols),
         '15m': len(feature_cols),
-        '1h': len(feature_cols),
-        '4h': len(feature_cols)
+        '45m': len(feature_cols)
     }
     
     logger.info(f"Loading model from {analyst_path}")
@@ -133,20 +129,31 @@ def prepare_data():
 
     # 4. Prepare Tensor Data
     state.lookbacks = {
-        '15m': config.analyst.lookback_15m,
-        '1h': config.analyst.lookback_1h,
-        '4h': config.analyst.lookback_4h
+        '5m': getattr(config.analyst, 'lookback_5m', 48),
+        '15m': getattr(config.analyst, 'lookback_15m', 16),
+        '45m': getattr(config.analyst, 'lookback_45m', 6)
     }
-    
+
+    # Optional: load precomputed component sequences for cross-asset attention
+    component_path = getattr(config.paths, 'component_sequences', None)
+    if component_path is not None and Path(component_path).exists():
+        try:
+            sequences, _ = load_component_sequences(component_path)
+            state.component_sequences = sequences[start_idx:].astype(np.float32)
+            logger.info(f"Loaded component sequences for visualization: {state.component_sequences.shape}")
+        except Exception as e:
+            logger.warning(f"Failed to load component sequences: {e}")
+            state.component_sequences = None
+
     # Store dataframes for access
     state.data = {
+        '5m': df_5m,
         '15m': df_15m,
-        '1h': df_1h,
-        '4h': df_4h,
-        'raw_close': df_15m_raw['close'].values # Use RAW close prices
+        '45m': df_45m,
+        'raw_close': df_5m_raw['close'].values  # Use RAW close prices
     }
     
-    logger.info(f"Ready to visualize {len(df_15m)} steps.")
+    logger.info(f"Ready to visualize {len(df_5m)} steps.")
 
 def simulation_loop():
     """Background thread to run the simulation."""
@@ -165,7 +172,7 @@ def simulation_loop():
             time.sleep(0.1)
             continue
             
-        if state.current_idx >= len(state.data['15m']):
+        if state.current_idx >= len(state.data['5m']):
             logger.info("Simulation finished. Restarting.")
             state.current_idx = max_lookback
             
@@ -182,21 +189,36 @@ def simulation_loop():
             if idx < lookback: return np.zeros((lookback, len(state.feature_cols)))
             return df[state.feature_cols].iloc[idx-lookback:idx].values.astype(np.float32)
 
+        x_5m = get_window(state.data['5m'], idx, state.lookbacks['5m'])
         x_15m = get_window(state.data['15m'], idx, state.lookbacks['15m'])
-        x_1h = get_window(state.data['1h'], idx, state.lookbacks['1h'])
-        x_4h = get_window(state.data['4h'], idx, state.lookbacks['4h'])
+        x_45m = get_window(state.data['45m'], idx, state.lookbacks['45m'])
         
         # To Tensor
-        t_15m = torch.tensor(x_15m, device=state.device).unsqueeze(0) # [1, L, F]
-        t_1h = torch.tensor(x_1h, device=state.device).unsqueeze(0)
-        t_4h = torch.tensor(x_4h, device=state.device).unsqueeze(0)
+        t_5m = torch.tensor(x_5m, device=state.device).unsqueeze(0) # [1, L, F]
+        t_15m = torch.tensor(x_15m, device=state.device).unsqueeze(0)
+        t_45m = torch.tensor(x_45m, device=state.device).unsqueeze(0)
+
+        component_tensor = None
+        if state.component_sequences is not None and idx < len(state.component_sequences):
+            component_tensor = torch.tensor(
+                state.component_sequences[idx],
+                device=state.device
+            ).unsqueeze(0)
         
         # 2. Model Inference
         with torch.no_grad():
             # Get activations and probs
             if hasattr(state.model, 'get_activations'):
-                context, activations = state.model.get_activations(t_15m, t_1h, t_4h)
-                _, probs = state.model.get_probabilities(t_15m, t_1h, t_4h)
+                if component_tensor is not None and hasattr(state.model, 'use_cross_asset_attention'):
+                    context, activations = state.model.get_activations(
+                        t_5m, t_15m, t_45m, component_data=component_tensor
+                    )
+                    _, probs = state.model.get_probabilities(
+                        t_5m, t_15m, t_45m, component_data=component_tensor
+                    )
+                else:
+                    context, activations = state.model.get_activations(t_5m, t_15m, t_45m)
+                    _, probs = state.model.get_probabilities(t_5m, t_15m, t_45m)
                 
                 # Process activations for JSON
                 act_data = {k: v[0].cpu().numpy().tolist() for k, v in activations.items()}

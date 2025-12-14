@@ -50,8 +50,9 @@ class Backtester:
     def __init__(
         self,
         initial_balance: float = 10000.0,
-        pip_value: float = 0.0001,
-        lot_size: float = 100000.0,  # Standard lot
+        pip_value: float = 1.0,       # NAS100: 1 point = 1.0 price movement (was 0.0001 for EURUSD)
+        lot_size: float = 1.0,        # NAS100 CFD: $1 per point (was 100000 for EURUSD)
+        point_multiplier: float = 1.0,  # PnL: points × pip_value × lot_size × multiplier = $1/point
         # Risk Management
         sl_atr_multiplier: float = 1.5,
         tp_atr_multiplier: float = 3.0,
@@ -64,8 +65,9 @@ class Backtester:
         """
         Args:
             initial_balance: Starting account balance
-            pip_value: Pip value for EURUSD
-            lot_size: Size of one standard lot
+            pip_value: Point value for NAS100 (1.0 = 1 point = 1.0 price movement)
+            lot_size: CFD lot size (1.0 for NAS100)
+            point_multiplier: PnL multiplier for dollar conversion
             sl_atr_multiplier: Stop Loss multiplier (SL = ATR * multiplier)
             tp_atr_multiplier: Take Profit multiplier (TP = ATR * multiplier)
             use_stop_loss: Enable/disable stop-loss mechanism
@@ -74,6 +76,7 @@ class Backtester:
         self.initial_balance = initial_balance
         self.pip_value = pip_value
         self.lot_size = lot_size
+        self.point_multiplier = point_multiplier
 
         # Risk Management
         self.sl_atr_multiplier = sl_atr_multiplier
@@ -142,9 +145,9 @@ class Backtester:
 
         pnl_pips_raw = self._calculate_pnl_pips(exit_price)  # Raw pips
         pnl_pips_sized = pnl_pips_raw * self.position_size   # Adjusted for position size
-        # FIXED: Use proper pip value calculation instead of hardcoded $10
-        # pip_value × lot_size = 0.0001 × 100000 = $10 for standard EURUSD lot
-        pnl_dollars = pnl_pips_sized * self.pip_value * self.lot_size
+        # PnL dollar conversion: points × pip_value × lot_size × multiplier
+        # NAS100: points × 0.1 × 1.0 × 10 = $1 per point (user confirmed)
+        pnl_dollars = pnl_pips_sized * self.pip_value * self.lot_size * self.point_multiplier
 
         # Record trade
         trade = TradeRecord(
@@ -184,8 +187,8 @@ class Backtester:
         self.entry_price = price
         self.entry_time = time
 
-        # Deduct spread cost (FIXED: use proper pip value calculation)
-        spread_cost = spread_pips * self.pip_value * self.lot_size * size
+        # Deduct spread cost (NAS100: points × pip_value × lot_size × multiplier)
+        spread_cost = spread_pips * self.pip_value * self.lot_size * self.point_multiplier * size
         self.balance -= spread_cost
 
     def _check_stop_loss_take_profit(
@@ -215,16 +218,16 @@ class Backtester:
         if self.position == 0:
             return 0.0, None
 
-        # Calculate dynamic SL/TP thresholds in pips
-        sl_pips_threshold = (atr * self.sl_atr_multiplier) / 0.0001
-        tp_pips_threshold = (atr * self.tp_atr_multiplier) / 0.0001
+        # Calculate dynamic SL/TP thresholds in points
+        sl_pips_threshold = (atr * self.sl_atr_multiplier) / self.pip_value
+        tp_pips_threshold = (atr * self.tp_atr_multiplier) / self.pip_value
 
         # Ensure minimum values
         sl_pips_threshold = max(sl_pips_threshold, 5.0)
         tp_pips_threshold = max(tp_pips_threshold, 5.0)
 
         # Calculate SL/TP price levels
-        pip_value = 0.0001
+        pip_value = self.pip_value
         if self.position == 1:  # Long
             sl_price = self.entry_price - sl_pips_threshold * pip_value
             tp_price = self.entry_price + tp_pips_threshold * pip_value
@@ -297,15 +300,15 @@ class Backtester:
         # Volatility Sizing: Calculate lot size based on risk
         if self.volatility_sizing:
             # Calculate SL distance in pips
-            sl_pips = (atr * self.sl_atr_multiplier) / 0.0001
+            sl_pips = (atr * self.sl_atr_multiplier) / self.pip_value
             sl_pips = max(sl_pips, 5.0)
 
-            # Risk Formula: Risk = Lots * 10 * SL_pips
-            # Lots = Risk / (10 * SL_pips)
-            # We use base_size_factor to scale the risk (e.g. 0.5x risk)
-
+            # NAS100 dollar risk sizing:
+            # Risk($) = size(lots) * sl_pips(points) * $/point
+            # $/point per 1 lot = pip_value * lot_size * point_multiplier
+            dollars_per_pip = self.pip_value * self.lot_size * self.point_multiplier
             risk_amount = self.risk_per_trade * base_size_factor
-            size = risk_amount / (10 * sl_pips)
+            size = risk_amount / (dollars_per_pip * sl_pips)
 
             # Cap size to avoid crazy leverage in ultra-low vol
             size = min(size, 50.0)  # Max 50 lots
@@ -341,8 +344,8 @@ class Backtester:
                 self._open_position(-1, size, close, time, spread_pips)
 
         # Record equity (mark-to-market using close price)
-        # FIXED: Use proper pip value calculation instead of hardcoded $10
-        unrealized_pnl = self._calculate_pnl_pips(close) * self.pip_value * self.lot_size * self.position_size
+        # NAS100: points × pip_value × lot_size × multiplier × position_size
+        unrealized_pnl = self._calculate_pnl_pips(close) * self.pip_value * self.lot_size * self.point_multiplier * self.position_size
         self.equity_history.append(self.balance + unrealized_pnl)
 
         # Record action and position
@@ -418,8 +421,9 @@ def run_backtest(
     if max_steps is None:
         max_steps = env.end_idx - start_idx  # Cover full test set
 
+    bar_minutes = 5  # Base timeframe is 5 minutes
     logger.info(f"Backtest coverage: start_idx={start_idx}, max_steps={max_steps} "
-                f"({max_steps * 15 / 60 / 24:.1f} days of 15m data)")
+                f"({max_steps * bar_minutes / 60 / 24:.1f} days of 5m data)")
     logger.info(f"Risk Management: SL={sl_atr_multiplier}x ATR (enabled={use_stop_loss}), "
                 f"TP={tp_atr_multiplier}x ATR (enabled={use_take_profit})")
     
@@ -428,6 +432,7 @@ def run_backtest(
 
     backtester = Backtester(
         initial_balance=initial_balance,
+        pip_value=getattr(env, 'pip_value', 1.0),
         sl_atr_multiplier=sl_atr_multiplier,
         tp_atr_multiplier=tp_atr_multiplier,
         use_stop_loss=use_stop_loss,
@@ -472,8 +477,8 @@ def run_backtest(
             high = close
             low = close
 
-        # Create timestamp (or use step number)
-        time = pd.Timestamp.now() + pd.Timedelta(minutes=15 * step)
+        # Create timestamp (5-minute bars for synthetic timing)
+        time = pd.Timestamp.now() + pd.Timedelta(minutes=bar_minutes * step)
 
         # Get ATR from environment
         atr = 0.001
@@ -491,7 +496,7 @@ def run_backtest(
     # Close any remaining position at the end
     if backtester.position != 0:
         final_price = env.close_prices[env.current_idx - 1]
-        final_time = pd.Timestamp.now() + pd.Timedelta(minutes=15 * step)
+        final_time = pd.Timestamp.now() + pd.Timedelta(minutes=bar_minutes * step)
         backtester._close_position(final_price, final_time)
         backtester.equity_history[-1] = backtester.balance
 

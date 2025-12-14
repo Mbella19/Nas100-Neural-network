@@ -9,7 +9,6 @@ export interface OHLCBar {
   high: number;
   low: number;
   close: number;
-  volume: number;
 }
 
 export interface TradeMarker {

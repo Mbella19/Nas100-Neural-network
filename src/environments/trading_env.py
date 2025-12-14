@@ -48,32 +48,34 @@ class TradingEnv(gym.Env):
 
     def __init__(
         self,
+        data_5m: np.ndarray,
         data_15m: np.ndarray,
-        data_1h: np.ndarray,
-        data_4h: np.ndarray,
+        data_45m: np.ndarray,
         close_prices: np.ndarray,
         market_features: np.ndarray,
+        component_data: Optional[np.ndarray] = None,
         analyst_model: Optional[torch.nn.Module] = None,
         context_dim: int = 64,
-        lookback_15m: int = 48,
-        lookback_1h: int = 24,
-        lookback_4h: int = 12,
-        spread_pips: float = 0.2,     # Razor/Raw spread
-        slippage_pips: float = 0.5,   # Includes commission + slippage
-        fomo_penalty: float = -1.0,   # v15: Meaningful penalty for missing moves (was 0.0)
+        lookback_5m: int = 48,
+        lookback_15m: int = 16,
+        lookback_45m: int = 6,
+        pip_value: float = 1.0,       # NAS100: 1 point = 1.0 price movement (was 0.0001 for EURUSD)
+        spread_pips: float = 3.5,     # NAS100 typical spread (was 0.2 for EURUSD)
+        slippage_pips: float = 1.5,   # NAS100 slippage (was 0.5 for EURUSD)
+        fomo_penalty: float = -0.5,   # v15: Meaningful penalty for missing moves (was 0.0)
         chop_penalty: float = 0.0,    # Disabled for stability
-        fomo_threshold_atr: float = 1.5,  # v15: Trigger on >1.5x ATR moves (was 2.0)
+        fomo_threshold_atr: float = 6.0,  # v15: Trigger on >1.5x ATR moves (was 2.0)
         chop_threshold: float = 80.0,     # Only extreme chop triggers penalty
         max_steps: int = 500,         # ~1 week for rapid regime cycling
-        reward_scaling: float = 1.0,  # v15: 1.0 per 1 pip (was 0.01 = 1.0 per 100 pips)
-        trade_entry_bonus: float = 0.5,  # v15: Bonus for opening positions to encourage exploration
+        reward_scaling: float = 0.01,  # NAS100: 1.0 per 100 points (was 1.0 per pip for EURUSD)
+        trade_entry_bonus: float = 0.003,   # NAS100: offset spread cost
         device: Optional[torch.device] = None,
         market_feat_mean: Optional[np.ndarray] = None,  # Pre-computed from training data
         market_feat_std: Optional[np.ndarray] = None,    # Pre-computed from training data
         pre_windowed: bool = True,  # FIXED: If True, data is already windowed (start_idx=0)
         # Risk Management
-        sl_atr_multiplier: float = 1.5, # Stop Loss = ATR * multiplier
-        tp_atr_multiplier: float = 3.0, # Take Profit = ATR * multiplier
+        sl_atr_multiplier: float = 2.0, # Stop Loss = ATR * multiplier
+        tp_atr_multiplier: float = 6.0, # Take Profit = ATR * multiplier
         use_stop_loss: bool = True,     # Enable/disable stop-loss
         use_take_profit: bool = True,   # Enable/disable take-profit
         # Regime-balanced sampling
@@ -92,17 +94,22 @@ class TradingEnv(gym.Env):
         ohlc_data: Optional[np.ndarray] = None,  # Shape: (n_samples, 4) with [open, high, low, close]
         timestamps: Optional[np.ndarray] = None,  # Optional timestamps for real time axis
         noise_level: float = 0.001,  # Anti-overfitting noise (default enabled)
+        # Full Eyes Features
+        returns: Optional[np.ndarray] = None, # Recent 5m log-returns
+        agent_lookback_window: int = 0, # How many return bars to see
+        include_attention_features: bool = False, # Include Cross-Asset Attention weights
     ):
         """
         Initialize the trading environment.
 
         Args:
+            data_5m: 5-minute feature data [num_samples, lookback_5m, features] (base timeframe)
             data_15m: 15-minute feature data [num_samples, lookback_15m, features]
-            data_1h: 1-hour feature data [num_samples, lookback_1h, features]
-            data_4h: 4-hour feature data [num_samples, lookback_4h, features]
+            data_45m: 45-minute feature data [num_samples, lookback_45m, features]
             close_prices: Close prices for PnL calculation [num_samples]
             market_features: Additional features [num_samples, n_features]
                             Expected: [atr, chop, adx, regime, sma_distance]
+            component_data: Optional component windows [num_samples, n_components, seq_len, features]
             analyst_model: Frozen Market Analyst for context generation
             context_dim: Dimension of context vector
             lookback_*: Lookback windows for each timeframe
@@ -116,6 +123,9 @@ class TradingEnv(gym.Env):
                            This balances PnL with penalties for "Sniper" behavior.
             device: Torch device for analyst inference
             noise_level: Std dev of Gaussian noise to add to observations (0.0 = disabled)
+            returns: Raw log-returns series for Agent's peripheral vision
+            agent_lookback_window: Number of return steps to observe
+            include_attention_features: Whether to include attention weights in observation
         """
         super().__init__()
 
@@ -123,11 +133,17 @@ class TradingEnv(gym.Env):
         self.noise_level = noise_level 
         if self.noise_level > 0:
             print(f"Gaussian Noise Injection ENABLED: sigma={self.noise_level}")
+        self.data_5m = data_5m.astype(np.float32)
         self.data_15m = data_15m.astype(np.float32)
-        self.data_1h = data_1h.astype(np.float32)
-        self.data_4h = data_4h.astype(np.float32)
+        self.data_45m = data_45m.astype(np.float32)
         self.close_prices = close_prices.astype(np.float32)
         self.market_features = market_features.astype(np.float32)
+        self.component_data = component_data.astype(np.float32) if component_data is not None else None
+        
+        # New "Full Eyes" data
+        self.returns = returns.astype(np.float32) if returns is not None else None
+        self.agent_lookback_window = agent_lookback_window
+        self.include_attention_features = include_attention_features
         
         # OHLC data for visualization (real candle data)
         self.ohlc_data = ohlc_data  # Shape: (n_samples, 4) = [open, high, low, close]
@@ -139,11 +155,12 @@ class TradingEnv(gym.Env):
         self.context_dim = context_dim
 
         # Lookback windows
+        self.lookback_5m = lookback_5m
         self.lookback_15m = lookback_15m
-        self.lookback_1h = lookback_1h
-        self.lookback_4h = lookback_4h
+        self.lookback_45m = lookback_45m
 
         # Trading parameters
+        self.pip_value = pip_value  # NAS100: 1.0 (1 point = 1.0 price movement)
         self.spread_pips = spread_pips
         self.slippage_pips = slippage_pips  # Realistic execution slippage
         self.fomo_penalty = fomo_penalty
@@ -178,7 +195,8 @@ class TradingEnv(gym.Env):
             self.start_idx = 0
         else:
             # Only compute start_idx if using raw DataFrames (create_env_from_dataframes)
-            self.start_idx = max(lookback_15m, lookback_1h * 4, lookback_4h * 16)
+            # Subsample ratios: 15m = 3x base (5m), 45m = 9x base (5m)
+            self.start_idx = max(lookback_5m, lookback_15m * 3, lookback_45m * 9)
         
         self.end_idx = len(close_prices) - 1
         self.n_samples = self.end_idx - self.start_idx
@@ -220,8 +238,24 @@ class TradingEnv(gym.Env):
         # Multi-class (3 classes): [p_down, p_neutral, p_up, edge, confidence, uncertainty] = 6
         n_market_features = market_features.shape[1] if len(market_features.shape) > 1 else 5
         analyst_metrics_dim = 5 if num_classes == 2 else 6
-        # Added +2 for [dist_to_sl, dist_to_tp] to fix Blind Spot
-        obs_dim = context_dim + 3 + n_market_features + analyst_metrics_dim + 2
+        
+        # Calculate extra dims
+        attention_dim = 0
+        if include_attention_features:
+            # Assuming n_components is last dim of component_data if available
+            if component_data is not None and len(component_data.shape) >= 2:
+                # component_data: [batch, n_components, seq_len, features]
+                attention_dim = component_data.shape[1] 
+            else:
+                attention_dim = 6 # Default fallback or explicit arg? 
+                # Better to be safe, stick to 6 (NAS100 default) or infer
+        
+        # Obs Dim = Context + Position(3) + Market + Analyst + SL/TP(2) + Returns + Attention
+        obs_dim = (context_dim + 3 + n_market_features + analyst_metrics_dim + 2 + 
+                  self.agent_lookback_window + attention_dim)
+                  
+        self.attention_dim = attention_dim # Store for use in _get_observation
+
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -261,6 +295,7 @@ class TradingEnv(gym.Env):
         # Precompute context vectors if analyst is provided
         self._precomputed_contexts = None
         self._precomputed_probs = None
+        self._precomputed_weights = None # Cache for attention weights
         
         # Use pre-computed cache if provided (for sequential context)
         self._precomputed_activations = {}
@@ -291,6 +326,7 @@ class TradingEnv(gym.Env):
 
         contexts = []
         probs_list = []
+        weights_list = [] # Store weights
         batch_size = 64
 
         with torch.no_grad():
@@ -298,31 +334,71 @@ class TradingEnv(gym.Env):
                 end_i = min(i + batch_size, self.n_samples)
                 actual_indices = range(self.start_idx + i, self.start_idx + end_i)
 
-                # Get batch data
+                # Get batch data (base/mid/high)
+                batch_5m = torch.tensor(
+                    self.data_5m[list(actual_indices)],
+                    device=self.device,
+                    dtype=torch.float32
+                )
                 batch_15m = torch.tensor(
                     self.data_15m[list(actual_indices)],
                     device=self.device,
                     dtype=torch.float32
                 )
-                batch_1h = torch.tensor(
-                    self.data_1h[list(actual_indices)],
+                batch_45m = torch.tensor(
+                    self.data_45m[list(actual_indices)],
                     device=self.device,
                     dtype=torch.float32
                 )
-                batch_4h = torch.tensor(
-                    self.data_4h[list(actual_indices)],
-                    device=self.device,
-                    dtype=torch.float32
-                )
+                batch_components = None
+                if self.component_data is not None and getattr(self.analyst, 'cross_asset_module', None) is not None:
+                    batch_components = torch.tensor(
+                        self.component_data[list(actual_indices)],
+                        device=self.device,
+                        dtype=torch.float32
+                    )
 
                 # Get context AND probabilities
                 if hasattr(self.analyst, 'get_probabilities'):
-                    context, probs = self.analyst.get_probabilities(batch_15m, batch_1h, batch_4h)
+                    if batch_components is not None:
+                        try:
+                            res = self.analyst.get_probabilities(
+                                batch_5m, batch_15m, batch_45m, component_data=batch_components
+                            )
+                        except TypeError:
+                            res = self.analyst.get_probabilities(batch_5m, batch_15m, batch_45m)
+                    else:
+                        res = self.analyst.get_probabilities(batch_5m, batch_15m, batch_45m)
+                    
+                    if len(res) == 3:
+                         context, probs, weights = res
+                    else:
+                         context, probs = res
+                         weights = None
+                         
                     contexts.append(context.cpu().numpy())
                     probs_list.append(probs.cpu().numpy())
+                    if weights is not None:
+                        # Flatten or keep structured?
+                        # _get_analyst_data returns flattened numpy. 
+                        # Best to store flattened [batch, dim] here for easier slicing later
+                        weights_list.append(weights.reshape(weights.size(0), -1).cpu().numpy())
+                    else:
+                        # Append None/Dummy or handle later? 
+                        # If we have mixed batches (?) or some fail, we need consistency.
+                        # Assuming if one batch has weights, all do (if comp data exists).
+                        pass
                 else:
                     # Fallback for old models
-                    context = self.analyst.get_context(batch_15m, batch_1h, batch_4h)
+                    if batch_components is not None:
+                        try:
+                            context = self.analyst.get_context(
+                                batch_5m, batch_15m, batch_45m, component_data=batch_components
+                            )
+                        except TypeError:
+                            context = self.analyst.get_context(batch_5m, batch_15m, batch_45m)
+                    else:
+                        context = self.analyst.get_context(batch_5m, batch_15m, batch_45m)
                     contexts.append(context.cpu().numpy())
                     # Default probs (neutral)
                     dummy_probs = np.zeros((len(context), 3), dtype=np.float32)
@@ -330,7 +406,7 @@ class TradingEnv(gym.Env):
                     probs_list.append(dummy_probs)
 
                 # Memory cleanup
-                del batch_15m, batch_1h, batch_4h, context
+                del batch_5m, batch_15m, batch_45m, batch_components, context
                 if i % (batch_size * 10) == 0:
                     if torch.backends.mps.is_available():
                         torch.mps.empty_cache()
@@ -338,7 +414,9 @@ class TradingEnv(gym.Env):
 
         self._precomputed_contexts = np.vstack(contexts).astype(np.float32)
         self._precomputed_probs = np.vstack(probs_list).astype(np.float32)
-        
+        if weights_list:
+            self._precomputed_weights = np.vstack(weights_list).astype(np.float32)
+            
         print(f"Precomputed {len(self._precomputed_contexts)} context vectors and probabilities")
 
     def _get_analyst_data(self, idx: int) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[Dict[str, np.ndarray]]]:
@@ -354,34 +432,56 @@ class TradingEnv(gym.Env):
                         k: v[context_idx] for k, v in self._precomputed_activations.items()
                     }
                 
+                # Get weights if available
+                weights = None
+                if self._precomputed_weights is not None:
+                     weights = self._precomputed_weights[context_idx]
+
                 return (
                     self._precomputed_contexts[context_idx],
                     self._precomputed_probs[context_idx],
-                    None,
+                    weights,
                     activations
                 )
 
         if self.analyst is not None:
             # Compute on-the-fly
             with torch.no_grad():
+                x_5m = torch.tensor(
+                    self.data_5m[idx:idx+1],
+                    device=self.device,
+                    dtype=torch.float32
+                )
                 x_15m = torch.tensor(
                     self.data_15m[idx:idx+1],
                     device=self.device,
                     dtype=torch.float32
                 )
-                x_1h = torch.tensor(
-                    self.data_1h[idx:idx+1],
+                x_45m = torch.tensor(
+                    self.data_45m[idx:idx+1],
                     device=self.device,
                     dtype=torch.float32
                 )
-                x_4h = torch.tensor(
-                    self.data_4h[idx:idx+1],
-                    device=self.device,
-                    dtype=torch.float32
-                )
+                comp_tensor = None
+                if self.component_data is not None and getattr(self.analyst, 'cross_asset_module', None) is not None:
+                    context_idx = idx - self.start_idx
+                    if 0 <= context_idx < len(self.component_data):
+                        comp_tensor = torch.tensor(
+                            self.component_data[context_idx:context_idx+1],
+                            device=self.device,
+                            dtype=torch.float32
+                        )
                 
                 if hasattr(self.analyst, 'get_activations'):
-                    context, activations = self.analyst.get_activations(x_15m, x_1h, x_4h)
+                    if comp_tensor is not None:
+                        try:
+                            context, activations = self.analyst.get_activations(
+                                x_5m, x_15m, x_45m, component_data=comp_tensor
+                            )
+                        except TypeError:
+                            context, activations = self.analyst.get_activations(x_5m, x_15m, x_45m)
+                    else:
+                        context, activations = self.analyst.get_activations(x_5m, x_15m, x_45m)
                     
                     # Convert activations to numpy
                     activations_np = {
@@ -390,7 +490,20 @@ class TradingEnv(gym.Env):
                     
                     # Get probs
                     if hasattr(self.analyst, 'get_probabilities'):
-                        _, probs = self.analyst.get_probabilities(x_15m, x_1h, x_4h)
+                        if comp_tensor is not None:
+                            try:
+                                res = self.analyst.get_probabilities(
+                                    x_5m, x_15m, x_45m, component_data=comp_tensor
+                                )
+                            except TypeError:
+                                res = self.analyst.get_probabilities(x_5m, x_15m, x_45m)
+                        else:
+                            res = self.analyst.get_probabilities(x_5m, x_15m, x_45m)
+
+                        if isinstance(res, (tuple, list)) and len(res) == 3:
+                            _, probs, _ = res
+                        else:
+                            _, probs = res
                         probs = probs.cpu().numpy().flatten()
                     else:
                         probs = np.array([0.5, 0.5], dtype=np.float32)
@@ -399,7 +512,15 @@ class TradingEnv(gym.Env):
                 
                 elif hasattr(self.analyst, 'get_probabilities'):
                     # Check if get_probabilities returns 3 values (new version)
-                    result = self.analyst.get_probabilities(x_15m, x_1h, x_4h)
+                    if comp_tensor is not None:
+                        try:
+                            result = self.analyst.get_probabilities(
+                                x_5m, x_15m, x_45m, component_data=comp_tensor
+                            )
+                        except TypeError:
+                            result = self.analyst.get_probabilities(x_5m, x_15m, x_45m)
+                    else:
+                        result = self.analyst.get_probabilities(x_5m, x_15m, x_45m)
                     if len(result) == 3:
                         context, probs, weights = result
                         weights = weights.cpu().numpy().flatten() if weights is not None else None
@@ -408,7 +529,15 @@ class TradingEnv(gym.Env):
                         weights = None
                     return context.cpu().numpy().flatten(), probs.cpu().numpy().flatten(), weights, None
                 else:
-                    context = self.analyst.get_context(x_15m, x_1h, x_4h)
+                    if comp_tensor is not None:
+                        try:
+                            context = self.analyst.get_context(
+                                x_5m, x_15m, x_45m, component_data=comp_tensor
+                            )
+                        except TypeError:
+                            context = self.analyst.get_context(x_5m, x_15m, x_45m)
+                    else:
+                        context = self.analyst.get_context(x_5m, x_15m, x_45m)
                     # Dummy probs - match num_classes
                     if self.num_classes == 2:
                         probs = np.array([0.5, 0.5], dtype=np.float32)  # Binary: neutral
@@ -506,9 +635,9 @@ class TradingEnv(gym.Env):
             atr = self.market_features[self.current_idx, 0]
             if atr > 1e-8:
                 # Replicate logic from _check_stop_loss_take_profit
-                sl_pips = max((atr * self.sl_atr_multiplier) / 0.0001, 5.0)
-                tp_pips = max((atr * self.tp_atr_multiplier) / 0.0001, 5.0)
-                pip_value = 0.0001
+                sl_pips = max((atr * self.sl_atr_multiplier) / self.pip_value, 5.0)
+                tp_pips = max((atr * self.tp_atr_multiplier) / self.pip_value, 5.0)
+                pip_value = self.pip_value
                 
                 if self.position == 1: # Long
                     sl_price = self.entry_price - sl_pips * pip_value
@@ -531,7 +660,64 @@ class TradingEnv(gym.Env):
             market_feat,
             analyst_metrics,
             np.array([dist_sl_norm, dist_tp_norm], dtype=np.float32)
-        ]) # Anti-Overfitting: Inject Gaussian Noise
+        ])
+        
+        # Append "Full Eyes" features
+        if self.agent_lookback_window > 0 and self.returns is not None:
+            # Slice recent returns
+            # Use current_idx + 1 because the 'returns' array aligns with close_prices
+            # We want [t - lookback + 1 ... t]
+            idx_start = self.current_idx - self.agent_lookback_window + 1
+            idx_end = self.current_idx + 1
+            if idx_start < 0:
+                # Pad with zeros if we are at the very beginning (unlikely due to start_idx)
+                returns_slice = np.zeros(self.agent_lookback_window, dtype=np.float32)
+                valid_len = idx_end
+                returns_slice[-valid_len:] = self.returns[0:idx_end]
+            else:
+                returns_slice = self.returns[idx_start:idx_end]
+            
+            # Multiply by 100 for normalization (returns are small floats)
+            obs = np.concatenate([obs, returns_slice * 100])
+            
+        if self.include_attention_features:
+            # Append attention weights
+            if weights is not None:
+                # weights shape is [batch, n_heads, 1, n_comp] or flattened
+                # We expect flattened from _get_analyst_data if multi-head logic was simplified there?
+                # Actually _get_analyst_data calls cpu().numpy().flatten().
+                # So it might be n_heads * n_comp.
+                # Ideally we want just [n_comp] (summed/averaged over heads)
+                # But for now let's just use what's returned.
+                # Wait, check _get_analyst_data line 433 in previous file view
+                # It flattens EVERYTHING.
+                # If weights is [n_heads, 1, n_comp], flattening gives n_heads*n_comp.
+                # This matches simple concatenation.
+                # We need to ensure observation space size matches.
+                # In __init__, I set attention_dim = component_data.shape[1] (n_comp).
+                # If weights are [heads * comp], I need to adjust attention_dim or average here.
+                
+                # Let's average over heads here to safe-guard dimensionality
+                if len(weights) > self.attention_dim:
+                    # Assume it is [n_heads * n_comp]
+                    # Reshape and mean
+                    w_reshaped = weights.reshape(-1, self.attention_dim)
+                    weights_mean = w_reshaped.mean(axis=0)
+                    obs = np.concatenate([obs, weights_mean])
+                elif len(weights) == self.attention_dim:
+                    obs = np.concatenate([obs, weights])
+                else:
+                    # Mismatch - pad or crop
+                    fixed_w = np.zeros(self.attention_dim, dtype=np.float32)
+                    avg_w = 1.0 / self.attention_dim
+                    fixed_w[:] = avg_w # Default strictly uniform
+                    obs = np.concatenate([obs, fixed_w])
+            else:
+                # No weights available (e.g. no analyst) - return uniform attention
+                uni = np.ones(self.attention_dim, dtype=np.float32) / self.attention_dim
+                obs = np.concatenate([obs, uni])
+                
+        # Anti-Overfitting: Inject Gaussian Noise
         if self.noise_level > 0:
             noise = np.random.normal(0, self.noise_level, size=obs.shape).astype(np.float32)
             obs += noise
@@ -544,7 +730,7 @@ class TradingEnv(gym.Env):
             return 0.0
 
         current_price = self.close_prices[self.current_idx]
-        pip_value = 0.0001  # EURUSD pip
+        pip_value = self.pip_value  # NAS100: 1.0 per point
 
         if self.position == 1:  # Long
             pnl_pips = (current_price - self.entry_price) / pip_value
@@ -574,7 +760,7 @@ class TradingEnv(gym.Env):
 
         # Get current bar OHLC
         close_price = self.close_prices[self.current_idx]
-        pip_value = 0.0001
+        pip_value = self.pip_value  # NAS100: 1.0 per point
 
         # FIXED: Get High/Low for accurate intra-bar SL/TP detection
         if self.ohlc_data is not None:
@@ -592,9 +778,9 @@ class TradingEnv(gym.Env):
         else:
             atr = 0.001  # Default fallback
 
-        # Calculate dynamic thresholds in pips
-        sl_pips_threshold = (atr * self.sl_atr_multiplier) / 0.0001
-        tp_pips_threshold = (atr * self.tp_atr_multiplier) / 0.0001
+        # Calculate dynamic thresholds in pips/points
+        sl_pips_threshold = (atr * self.sl_atr_multiplier) / self.pip_value
+        tp_pips_threshold = (atr * self.tp_atr_multiplier) / self.pip_value
 
         # Enforce minimums (e.g. 5 pips) to prevent noise stop-outs
         sl_pips_threshold = max(sl_pips_threshold, 5.0)
@@ -811,9 +997,9 @@ class TradingEnv(gym.Env):
         
         if self.volatility_sizing and len(self.market_features.shape) > 1:
             atr = self.market_features[self.current_idx, 0]
-            # Calculate SL pips for this ATR
-            sl_pips = (atr * self.sl_atr_multiplier) / 0.0001
-            sl_pips = max(sl_pips, 5.0) # Minimum 5 pips
+            # Calculate SL pips/points for this ATR
+            sl_pips = (atr * self.sl_atr_multiplier) / self.pip_value
+            sl_pips = max(sl_pips, 5.0) # Minimum 5 points
             
             # Calculate volatility scalar
             # Example: Target=15, SL=30 (High Vol) -> Scalar = 0.5 -> Size halved
@@ -846,7 +1032,7 @@ class TradingEnv(gym.Env):
 
         # Calculate price move for FOMO detection
         price_move = abs(current_price - prev_price)
-        pip_value = 0.0001
+        pip_value = self.pip_value  # NAS100: 1.0 per point
 
         # Handle position changes
         # Reward structure: Continuous pnl_delta rewards every step.
@@ -1150,6 +1336,7 @@ def create_env_from_dataframes(
     feature_cols: Optional[list] = None,
     config: Optional[object] = None,
     device: Optional[torch.device] = None,
+    component_sequences: Optional[np.ndarray] = None,
     noise_level: float = 0.001
 ) -> TradingEnv:
     """
@@ -1165,6 +1352,8 @@ def create_env_from_dataframes(
         feature_cols: Feature columns to use
         config: TradingConfig object
         device: Torch device for analyst inference
+        component_sequences: Optional precomputed component windows aligned to base index
+                             Shape: [n_total_samples, n_components, seq_len, n_features]
 
     Returns:
         TradingEnv instance
@@ -1175,22 +1364,27 @@ def create_env_from_dataframes(
         feature_cols = ['open', 'high', 'low', 'close', 'atr',
                        'pinbar', 'engulfing', 'doji', 'ema_trend', 'regime']
 
-    # Get default config values
-    lookback_15m = 48
-    lookback_1h = 24
-    lookback_4h = 12
+    # Get default config values (5m/15m/45m system)
+    # We keep legacy names in the signature for compatibility, but these now mean:
+    #   df_15m -> 5m base
+    #   df_1h  -> 15m mid
+    #   df_4h  -> 45m high
+    lookback_5m = 48
+    lookback_15m = 16
+    lookback_45m = 6
 
     if config is not None:
-        lookback_15m = getattr(config, 'lookback_15m', 48)
-        lookback_1h = getattr(config, 'lookback_1h', 24)
-        lookback_4h = getattr(config, 'lookback_4h', 12)
+        # Support both new and legacy config field names
+        lookback_5m = getattr(config, 'lookback_5m', getattr(config, 'lookback_15m', lookback_5m))
+        lookback_15m = getattr(config, 'lookback_15m', getattr(config, 'lookback_1h', lookback_15m))
+        lookback_45m = getattr(config, 'lookback_45m', getattr(config, 'lookback_4h', lookback_45m))
 
-    # Subsampling ratios: how many 15m bars per higher TF bar
-    subsample_1h = 4   # 4 x 15m = 1H
-    subsample_4h = 16  # 16 x 15m = 4H
+    # Subsampling ratios: how many 5m bars per higher TF bar
+    subsample_15m = 3   # 3 x 5m = 15m
+    subsample_45m = 9   # 9 x 5m = 45m
 
     # Calculate valid range - need enough indices for subsampled lookback
-    start_idx = max(lookback_15m, lookback_1h * subsample_1h, lookback_4h * subsample_4h)
+    start_idx = max(lookback_5m, lookback_15m * subsample_15m, lookback_45m * subsample_45m)
     n_samples = len(df_15m) - start_idx
 
     # Get feature arrays
@@ -1199,29 +1393,28 @@ def create_env_from_dataframes(
     features_4h = df_4h[feature_cols].values.astype(np.float32)
 
     # Create windows for each timeframe
-    data_15m = np.zeros((n_samples, lookback_15m, len(feature_cols)), dtype=np.float32)
-    data_1h = np.zeros((n_samples, lookback_1h, len(feature_cols)), dtype=np.float32)
-    data_4h = np.zeros((n_samples, lookback_4h, len(feature_cols)), dtype=np.float32)
+    data_15m = np.zeros((n_samples, lookback_5m, len(feature_cols)), dtype=np.float32)
+    data_1h = np.zeros((n_samples, lookback_15m, len(feature_cols)), dtype=np.float32)
+    data_4h = np.zeros((n_samples, lookback_45m, len(feature_cols)), dtype=np.float32)
 
     for i in range(n_samples):
         actual_idx = start_idx + i
         # 15m: direct indexing (includes current candle)
-        data_15m[i] = features_15m[actual_idx - lookback_15m + 1:actual_idx + 1]
+        data_15m[i] = features_15m[actual_idx - lookback_5m + 1:actual_idx + 1]
 
-        # FIXED: 1H - subsample every 4th bar from aligned data, INCLUDING current candle
-        # Note: range() is exclusive at end, so we use actual_idx + 1 to include current
+        # 15m mid timeframe: subsample every 3rd bar from aligned data
         idx_range_1h = list(range(
-            actual_idx - (lookback_1h - 1) * subsample_1h,
+            actual_idx - (lookback_15m - 1) * subsample_15m,
             actual_idx + 1,
-            subsample_1h
+            subsample_15m
         ))
         data_1h[i] = features_1h[idx_range_1h]
 
-        # FIXED: 4H - subsample every 16th bar from aligned data, INCLUDING current candle
+        # 45m high timeframe: subsample every 9th bar from aligned data
         idx_range_4h = list(range(
-            actual_idx - (lookback_4h - 1) * subsample_4h,
+            actual_idx - (lookback_45m - 1) * subsample_45m,
             actual_idx + 1,
-            subsample_4h
+            subsample_45m
         ))
         data_4h[i] = features_4h[idx_range_4h]
 
@@ -1239,28 +1432,82 @@ def create_env_from_dataframes(
         except:
             pass  # Keep timestamps as None if conversion fails
 
-    # Market features for reward shaping (includes S/R for breakout vs chase detection)
-    market_cols = ['atr', 'chop', 'adx', 'regime', 'sma_distance', 'dist_to_support', 'dist_to_resistance']
-    available_cols = [c for c in market_cols if c in df_15m.columns]
-    market_features = df_15m[available_cols].values[start_idx:start_idx + n_samples].astype(np.float32)
+    # Market features for reward shaping / agent observation.
+    # NOTE: Legacy signature uses df_15m/df_1h/df_4h naming, but in the 5m/15m/45m system:
+    #   df_15m -> 5m base, df_1h -> 15m mid, df_4h -> 45m high.
+    try:
+        from config.settings import SMCConfig
+        from src.data.microstructure import add_smc_microstructure_features
+        from src.data.feature_names import (
+            SMC_FEATURE_COLUMNS,
+            AGENT_TF_BASE_FEATURE_COLUMNS,
+            AGENT_MARKET_FEATURE_COLUMNS,
+        )
 
-    # Extract config values (defaults match config/settings.py fixes)
-    spread_pips = 0.2  # Razor/Raw spread
+        smc_cfg = SMCConfig()
+        include_higher_tfs = bool(getattr(smc_cfg, "include_higher_timeframes", True))
+
+        # Ensure 5m SMC exists on base frame
+        if any(c not in df_15m.columns for c in SMC_FEATURE_COLUMNS):
+            add_smc_microstructure_features(df_15m, smc_cfg.for_timeframe_minutes(5), inplace=True)
+
+        if include_higher_tfs:
+            # Ensure higher TF SMC exists (prefer native; fallback computes on aligned series)
+            if any(c not in df_1h.columns for c in SMC_FEATURE_COLUMNS):
+                add_smc_microstructure_features(df_1h, smc_cfg.for_timeframe_minutes(15), inplace=True)
+            if any(c not in df_4h.columns for c in SMC_FEATURE_COLUMNS):
+                add_smc_microstructure_features(df_4h, smc_cfg.for_timeframe_minutes(45), inplace=True)
+
+            tf_cols = list(AGENT_TF_BASE_FEATURE_COLUMNS) + list(SMC_FEATURE_COLUMNS)
+            for tf_suffix, df_tf in (("15m", df_1h), ("45m", df_4h)):
+                for col in tf_cols:
+                    target = f"{col}_{tf_suffix}"
+                    if target in df_15m.columns:
+                        continue
+                    if col in df_tf.columns:
+                        df_15m[target] = df_tf[col].values.astype(np.float32)
+                    else:
+                        df_15m[target] = 0.0
+
+        market_cols = list(AGENT_MARKET_FEATURE_COLUMNS)
+        for col in market_cols:
+            if col not in df_15m.columns:
+                df_15m[col] = 0.0
+        df_15m[market_cols] = df_15m[market_cols].fillna(0.0).astype(np.float32)
+        market_features = df_15m[market_cols].values[start_idx:start_idx + n_samples].astype(np.float32)
+    except Exception:
+        # Fallback: original minimal market feature set
+        market_cols = ['atr', 'chop', 'adx', 'regime', 'sma_distance', 'dist_to_support', 'dist_to_resistance']
+        available_cols = [c for c in market_cols if c in df_15m.columns]
+        market_features = df_15m[available_cols].values[start_idx:start_idx + n_samples].astype(np.float32)
+
+    # Optional component windows for cross-asset attention
+    component_data = None
+    if component_sequences is not None:
+        try:
+            component_data = component_sequences[start_idx:start_idx + n_samples].astype(np.float32)
+        except Exception:
+            component_data = None
+
+    # Extract config values (defaults for NAS100)
+    pip_value = 1.0  # NAS100: 1 point = 1.0 price movement
+    spread_pips = 2.5  # NAS100 typical spread (was 0.2 for EURUSD)
     fomo_penalty = -0.05  # Reduced from -0.5 (was dominating PnL rewards)
     chop_penalty = -0.01  # Reduced from -0.1
     fomo_threshold_atr = 2.0  # Only trigger on significant moves
     chop_threshold = 80.0  # Only extreme chop triggers penalty
-    reward_scaling = 0.5  # Increased to make PnL signal stronger vs penalties
+    reward_scaling = 0.01  # NAS100: 1 reward per 100 points
     sl_atr_multiplier = 1.0
     tp_atr_multiplier = 3.0
     use_stop_loss = True
     use_take_profit = True
     volatility_sizing = True
-    risk_pips_target = 15.0
+    risk_pips_target = 50.0  # NAS100: ~50 points (was 15 for EURUSD)
     enforce_analyst_alignment = False  # DISABLED: Soft masking breaks PPO gradients
     num_classes = 2
 
     if config is not None:
+        pip_value = getattr(config, 'pip_value', pip_value)
         spread_pips = getattr(config, 'spread_pips', spread_pips)
         fomo_penalty = getattr(config, 'fomo_penalty', fomo_penalty)
         chop_penalty = getattr(config, 'chop_penalty', chop_penalty)
@@ -1273,7 +1520,6 @@ def create_env_from_dataframes(
         use_take_profit = getattr(config, 'use_take_profit', use_take_profit)
         volatility_sizing = getattr(config, 'volatility_sizing', volatility_sizing)
         risk_pips_target = getattr(config, 'risk_pips_target', risk_pips_target)
-        risk_pips_target = getattr(config, 'risk_pips_target', risk_pips_target)
         enforce_analyst_alignment = getattr(config, 'enforce_analyst_alignment', enforce_analyst_alignment)
         noise_level = getattr(config, 'noise_level', noise_level)
 
@@ -1281,17 +1527,20 @@ def create_env_from_dataframes(
         num_classes = getattr(analyst_model, 'num_classes', 2)
 
     return TradingEnv(
-        data_15m=data_15m,
-        data_1h=data_1h,
-        data_4h=data_4h,
+        # Map legacy arg names to TradingEnv signature
+        data_5m=data_15m,
+        data_15m=data_1h,
+        data_45m=data_4h,
         close_prices=close_prices,
         market_features=market_features,
+        component_data=component_data,
         analyst_model=analyst_model,
+        lookback_5m=lookback_5m,
         lookback_15m=lookback_15m,
-        lookback_1h=lookback_1h,
-        lookback_4h=lookback_4h,
+        lookback_45m=lookback_45m,
         device=device,
-        # Config Params
+        # Config Params (NAS100)
+        pip_value=pip_value,
         spread_pips=spread_pips,
         fomo_penalty=fomo_penalty,
         chop_penalty=chop_penalty,

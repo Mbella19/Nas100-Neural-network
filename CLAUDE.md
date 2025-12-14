@@ -4,14 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a **hybrid trading system for EURUSD** combining supervised learning (Market Analyst) and reinforcement learning (PPO Agent). The project is optimized for Apple M2 Silicon with 8GB RAM constraints.
+This is a **hybrid trading system for NAS100** (Nasdaq-100 Index CFD via Oanda) combining supervised learning (Market Analyst) and reinforcement learning (PPO Agent). The project is optimized for Apple M2 Silicon with 8GB RAM constraints.
 
 ## System Architecture
 
 **Two-Phase Hierarchical Design:**
 
 1. **Phase A - Market Analyst (Supervised Learning)**
-   - Multi-timeframe encoder (15m, 1H, 4H)
+   - Multi-timeframe encoder (5m, 15m, 45m)
    - Produces context vectors for RL agent
    - Trained on smoothed future returns (NOT next-step price)
    - Frozen after pre-training
@@ -39,11 +39,22 @@ Python 3.10+, PyTorch 2.0+, Stable Baselines 3, Gymnasium, Pandas, NumPy, pandas
 
 ## Data Requirements
 
-- Source: EURUSD 1-minute OHLCV (5 years, ~2.6M rows)
-- Location: `/Users/gervaciusjr/Desktop/AI Trading Bot/Training data/eurusd_m1_5y_part2_no_gaps.csv`
-- Multi-timeframe: Resample 1m → 15m, 1H, 4H using forward-fill on complete datetime index
+- Source: NAS100 1-minute OHLCV (5+ years, ~2.1M rows)
+- Location: `/Users/gervaciusjr/Desktop/Oanda data/NAS100_USD_1min_data.csv`
+- Multi-timeframe: Resample 1m → 5m/15m/45m using `label="right", closed="left"` (no look-ahead)
 - Gap handling: Create complete `pd.date_range()` index, then `.reindex().ffill()`
-- **CRITICAL**: All timeframes are aligned to the 15m index via forward-fill. 1H and 4H data are subsampled from this aligned index (every 4th and 16th bar respectively) to maintain temporal consistency.
+- **CRITICAL**: All timeframes are aligned to the 5m index via forward-fill. 15m and 45m sequences are subsampled from this aligned index (every 3rd and 9th bar respectively) to maintain temporal consistency.
+
+## NAS100 Instrument Specifications (Oanda CFD)
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| Point Value | 1.0 | 1 point = 1.0 price movement (e.g., 13500 → 13501 = 1 point) |
+| Tick Size | 0.1 | Minimum displayable price increment |
+| Lot Size | 1.0 | CFD lot |
+| Dollar per Point | $1 | Per standard lot |
+| Typical Spread | 2.0-3.0 points | Varies by session |
+| Trading Hours | 24/5 | All available CFD hours used |
 
 ## Feature Engineering Categories
 
@@ -51,13 +62,14 @@ Python 3.10+, PyTorch 2.0+, Stable Baselines 3, Gymnasium, Pandas, NumPy, pandas
 2. **Market Structure**: Fractal S/R levels, ATR-normalized distance to S/R
 3. **Trend Filters**: SMA(200) distance/ATR, EMA crossovers
 4. **Regime Detection**: Choppiness Index (>61.8 = ranging, <38.2 = trending), ADX (>25 = trending)
+5. **Agent-Only SMC Microstructure (OHLC-only)**: Fair Value Gaps, Order Blocks, Liquidity Sweeps, Premium/Discount + OTE, Displacement candles, pressure proxies, killzones (`src/data/microstructure.py`) with PPO visibility across 5m/15m/45m plus 1m SMC resampled to the 5m grid (`src/data/feature_names.py`)
 
 ## Key Implementation Details
 
 ### Market Analyst (src/models/analyst.py)
 
 - **Architecture**: TCN (default) or Transformer - TCN is more stable for binary classification
-- Separate `TemporalEncoder` for each timeframe (15m, 1H, 4H)
+- Separate `TemporalEncoder` for each timeframe (5m, 15m, 45m)
 - `AttentionFusion` layer combines to produce context vector `[batch, context_dim]`
 - **Target**: Smoothed future return (NOT next-step price): `df['close'].shift(-12).rolling(12).mean() / df['close'] - 1`
 - Training: AdamW optimizer, lr=1e-4 to 3e-4, batch_size=32-64, MSE/Huber loss, early stopping
@@ -72,20 +84,24 @@ Python 3.10+, PyTorch 2.0+, Stable Baselines 3, Gymnasium, Pandas, NumPy, pandas
 **Observation Space**: `gym.spaces.Box` containing:
 - Context vector from Analyst (context_dim)
 - Position state: [position, entry_price_norm, unrealized_pnl_norm]
-- Market features (normalized): [atr, chop, adx, regime, sma_distance]
+- Market features (normalized): base market state + structure/session flags + **SMC microstructure features** (agent-only)
+
+**SMC Note**: SMC features are appended to `market_features` for the RL agent only. The Analyst input feature set remains unchanged (no SMC columns in `MODEL_FEATURE_COLS`).
+
+**MT5 Bridge Note**: After changing `MARKET_FEATURE_COLS` (live observation layout), regenerate `models/agent/market_feat_stats.npz` with `python scripts/prepare_mt5_bridge_artifacts.py` so live normalization matches training.
 
 **Reward Function** (CRITICAL - uses continuous PnL delta, not exit-only):
 ```python
 # Continuous PnL: reward based on CHANGE in unrealized PnL each step
 pnl_delta = current_unrealized_pnl - prev_unrealized_pnl
-reward = pnl_delta * reward_scaling  # reward_scaling = 1.0 (v15: 1 reward per pip)
+reward = pnl_delta * reward_scaling  # reward_scaling = 0.01 (NAS100: 1 reward per 100 points)
 
 # Transaction cost when opening (NOT closing)
 if opened_trade:
     reward -= spread_pips * position_size * reward_scaling
-    reward += trade_entry_bonus  # v15: +0.5 to encourage exploration
+    reward += trade_entry_bonus  # 0.03 to encourage exploration
 
-# FOMO: -1.0 if flat during high-momentum moves (|price_move| > 1.5*ATR)
+# FOMO: -0.5 if flat during high-momentum moves (|price_move| > 4*ATR)
 # Chop: disabled (was causing over-penalization)
 ```
 
@@ -106,7 +122,7 @@ PPO("MlpPolicy", env, learning_rate=3e-4, n_steps=2048, batch_size=256,
 ## Execution Pipeline
 
 **Full pipeline** (`scripts/run_pipeline.py`):
-1. Load & clean 1m OHLCV → resample to 15m/1H/4H → align timeframes → engineer features
+1. Load & clean 1m OHLCV → resample to 5m/15m/45m → align timeframes → engineer features
 2. Train Market Analyst on smoothed future returns (85% train, 15% val)
 3. Freeze Analyst weights (`param.requires_grad = False`, `.eval()`)
 4. Initialize TradingEnv with frozen Analyst → train PPO agent (5M timesteps)
@@ -188,24 +204,22 @@ except:
 - `prev_unrealized_pnl` is reset to 0 when closing positions (critical for multi-trade episodes)
 
 **Multi-Timeframe Alignment** (commit 2c41eec):
-- All timeframes forward-filled to 15m index, then subsampled (1H=every 4th, 4H=every 16th)
+- All timeframes forward-filled to the 5m index, then subsampled (15m=every 3rd, 45m=every 9th)
 - `prepare_env_data()` and `create_env_from_dataframes()` correctly subsample aligned data
 
 **Normalization** (commit 53581a8):
-- Z-score normalization applied to ALL features (open, high, low, close, indicators)
-- Separate normalizers per timeframe (15m, 1H, 4H) saved to `models/analyst/normalizer_{tf}.pkl`
-- Prevents scale inconsistencies (ATR ~0.001 vs CHOP 0-100 vs price ~1.05)
+- Z-score normalization applied to MODEL INPUT features; raw OHLC + ATR/CHOP/ADX are kept raw for PnL/reward thresholds
+- Separate normalizers per timeframe (5m, 15m, 45m) saved to `models/analyst/normalizer_{tf}.pkl`
+- Prevents scale inconsistencies (ATR ~50-200 for NAS100 vs CHOP 0-100 vs price ~8000-25000)
 
-**Policy Collapse Fix (v15)**:
-- Agent was converging to 99% flat after 4.5M timesteps due to weak reward signal and low entropy
-- **Root causes**: `reward_scaling=0.01` (too weak), `ent_coef=0.01` (rapid policy collapse), `fomo_penalty=-0.05` (too small)
-- **Fixes applied**:
-  - `reward_scaling`: 0.01 → 1.0 (100x increase, 1 reward per pip)
-  - `ent_coef`: 0.01 → 0.1 (10x increase, forces exploration)
-  - `fomo_penalty`: -0.05 → -1.0 (20x increase, meaningful punishment for inaction)
-  - `net_arch`: [64, 64] → [256, 256] (larger policy network)
-  - `trade_entry_bonus`: NEW - 0.5 bonus for opening positions (offsets entry cost)
-- Must delete old checkpoints and retrain from scratch (policy has converged to degenerate state)
+**NAS100 Calibration**:
+- `pip_value`: 1.0 (1 point = 1.0 price movement)
+- `lot_size`: 1.0 ($1 per point per lot, confirmed by user)
+- `spread_pips`: 2.5 (NAS100 typical spread 2-3 points)
+- `reward_scaling`: 0.01 (1 reward per 100 points)
+- `trade_entry_bonus`: 0.03 (offsets spread cost)
+- `fomo_penalty`: -0.5 (moderate penalty for missing moves)
+- `risk_pips_target`: 50.0 (volatility sizing reference)
 
 ## Common Pitfalls
 
@@ -220,7 +234,7 @@ except:
 | Choppy markets | Chop avoidance penalty |
 | Death spiral in chop | Use continuous PnL delta, not exit-only rewards |
 | Timeframe misalignment | Forward-fill all to 15m, then subsample higher TFs |
-| **Policy collapse to flat (v15)** | **ent_coef=0.1, reward_scaling=1.0, trade_entry_bonus=0.5, fomo_penalty=-1.0** |
+| **Policy collapse to flat** | **ent_coef=0.01, reward_scaling=0.01 (NAS100), trade_entry_bonus=0.03** |
 
 ## Validation Checklist
 
@@ -309,7 +323,7 @@ callback = AgentTrainingLogger(log_dir="models/agent", enable_visualization=True
 ## File Organization Specifics
 
 **Data Flow**:
-- Raw: `data/raw/eurusd_m1_5y_part2_no_gaps.csv` (external: `/Users/gervaciusjr/Desktop/AI Trading Bot/Training data/`)
+- Raw: `NAS100_USD_1min_data.csv` (external: `/Users/gervaciusjr/Desktop/Oanda data/`)
 - Processed: `data/processed/features_{15m,1h,4h}.parquet` (pre-normalization)
 - Normalized: `data/processed/features_{15m,1h,4h}_normalized.parquet` (post-normalization)
 
@@ -340,10 +354,10 @@ obs = [context_vector (32), analyst_metrics (5), position_state (3), market_feat
 # sl_tp_dist: [distance to SL, distance to TP] normalized by ATR
 ```
 
-**Reward Scaling Logic (v15)** (config/settings.py):
-- `reward_scaling = 1.0` converts ±1 pip trade to ±1.0 reward (direct mapping)
-- `trade_entry_bonus = 0.5` offsets entry costs (~0.7 pips) to encourage exploration
-- `fomo_penalty = -1.0` makes missing momentum moves costly
+**Reward Scaling Logic (NAS100)** (config/settings.py):
+- `reward_scaling = 0.01` converts ±100 points to ±1.0 reward (NAS100 calibration)
+- `trade_entry_bonus = 0.03` offsets entry costs (~2.5 point spread) to encourage exploration
+- `fomo_penalty = -0.5` makes missing momentum moves costly
 - Encourages "Sniper" behavior: selective, high-quality trades after exploration phase
 
 ## Debugging & Monitoring
@@ -367,26 +381,28 @@ print(f"Train end: {train_end_idx}, Total samples: {len(df_15m)}")
 # Verify test env receives same train stats, NOT test stats
 ```
 
-## Current Hyperparameters (v15)
+## Current Hyperparameters (NAS100)
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
-| `reward_scaling` | 1.0 | 1 reward per pip |
-| `ent_coef` | 0.1 | High exploration (was 0.01) |
-| `fomo_penalty` | -1.0 | Punish inaction (was -0.05) |
-| `trade_entry_bonus` | 0.5 | Encourage trading (NEW) |
-| `net_arch` | [256, 256] | Larger network (was [64, 64]) |
-| `learning_rate` | 3e-4 | Standard |
+| `pip_value` | 1.0 | 1 point = 1.0 price movement |
+| `lot_size` | 1.0 | CFD lot ($1/point) |
+| `spread_pips` | 2.5 | NAS100 typical spread |
+| `reward_scaling` | 0.01 | 1 reward per 100 points |
+| `ent_coef` | 0.01 | Exploration coefficient |
+| `fomo_penalty` | -0.5 | Punish inaction |
+| `trade_entry_bonus` | 0.03 | Offset spread cost |
+| `net_arch` | [256, 256] | Policy network |
+| `learning_rate` | 1e-4 | Standard |
 | `n_steps` | 2048 | Steps per update |
 | `batch_size` | 256 | Minibatch size |
 | `total_timesteps` | 20M | Long training run |
 
 ## Training Progress Indicators
 
-**Healthy v15 Training @ 1M steps:**
-- Action Distribution: ~35% Flat, 15-25% Long, 40-50% Short
-- Avg Reward: Improving from -2800 → -700 (should approach 0 by 5M)
-- Max Episode Reward: Should see positive episodes (+1000 to +3700)
+**Healthy NAS100 Training @ 1M steps:**
+- Action Distribution: ~35% Flat, 30-35% Long, 30-35% Short
+- Avg Reward: Should improve steadily (reward per 100 points)
 - Mean Trades: ~100-200/episode (will decrease as agent becomes selective)
 - Win Rate: ~40-50% (should improve to >50% after 3M steps)
 
