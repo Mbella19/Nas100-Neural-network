@@ -60,8 +60,8 @@ class TradingEnv(gym.Env):
         lookback_15m: int = 16,
         lookback_45m: int = 6,
         pip_value: float = 1.0,       # NAS100: 1 point = 1.0 price movement (was 0.0001 for EURUSD)
-        spread_pips: float = 3.5,     # NAS100 typical spread (was 0.2 for EURUSD)
-        slippage_pips: float = 1.5,   # NAS100 slippage (was 0.5 for EURUSD)
+        spread_pips: float = 4.5,     # NAS100 typical spread (was 0.2 for EURUSD)
+        slippage_pips: float = 2.5,   # NAS100 slippage (was 0.5 for EURUSD)
         fomo_penalty: float = -0.5,   # v15: Meaningful penalty for missing moves (was 0.0)
         chop_penalty: float = 0.0,    # Disabled for stability
         fomo_threshold_atr: float = 6.0,  # v15: Trigger on >1.5x ATR moves (was 2.0)

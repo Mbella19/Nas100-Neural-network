@@ -203,8 +203,8 @@ class InstrumentConfig:
 @dataclass
 class TradingConfig:
     """Trading environment configuration for NAS100."""
-    spread_pips: float = 3.5    # Increased spread (was 2.5)
-    slippage_pips: float = 1.5  # Increased slippage (was 1.0)
+    spread_pips: float = 4.5    # NAS100 typical spread
+    slippage_pips: float = 2.5  # NAS100 typical slippage
 
     # Confidence filtering: Only take trades when agent probability >= threshold
     min_action_confidence: float = 0.0  # Filter low-confidence trades (0.0 = disabled)
@@ -407,29 +407,6 @@ class SMCConfig:
 
 
 @dataclass
-class VisualizationConfig:
-    """Real-time training visualization configuration."""
-
-    # Enable/disable visualization
-    enabled: bool = True
-
-    # Server settings
-    host: str = "0.0.0.0"
-    port: int = 8000
-
-    # Update rates
-    update_hz: int = 10  # WebSocket updates per second
-
-    # Buffer sizes
-    max_snapshots: int = 10000
-    max_price_bars: int = 500
-    max_trades: int = 100
-
-    # Frontend URL (for CORS)
-    frontend_url: str = "http://localhost:3000"
-
-
-@dataclass
 class Config:
     """Master configuration combining all sub-configs."""
 
@@ -441,7 +418,6 @@ class Config:
     agent: AgentConfig = field(default_factory=AgentConfig)
     features: FeatureConfig = field(default_factory=FeatureConfig)
     smc: SMCConfig = field(default_factory=SMCConfig)
-    visualization: VisualizationConfig = field(default_factory=VisualizationConfig)
 
     # Global settings
     seed: int = 42

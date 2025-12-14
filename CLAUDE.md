@@ -266,59 +266,7 @@ python scripts/run_pipeline.py --backtest-only   # Only run backtest
 python -m src.training.train_analyst     # Train Analyst only
 python -m src.training.train_agent       # Train Agent only (requires trained Analyst)
 python -m src.evaluation.backtest        # Run backtest only
-
-# Real-time Visualization Dashboard
-cd frontend && npm install               # First time setup
-python scripts/start_dashboard.py        # Start dashboard (backend + frontend)
 ```
-
-## Real-Time Visualization Dashboard
-
-A stunning React + Next.js dashboard for monitoring training in real-time.
-
-**Architecture**:
-- Backend: FastAPI + WebSocket (port 8000)
-- Frontend: Next.js + Recharts + Framer Motion (port 3000)
-- Non-blocking: Training never slows down due to visualization
-
-**Features**:
-- **Price Chart**: TradingView-style candlesticks with trade markers, SL/TP lines
-- **Neural Network Flow**: Animated attention weights, encoder activations, direction predictions
-- **Training Metrics**: Loss curves, episode rewards, equity curve with drawdown
-- **Market Gauges**: ATR, Choppiness, ADX, regime indicators
-- **Agent Panel**: Position status, value estimates, action probabilities
-- **Reward Breakdown**: Waterfall chart showing PnL delta, penalties, bonuses
-- **Trade Log**: Live entry/exit tracking with win rate stats
-- **System Status**: Memory usage, training speed, connection status
-
-**Setup**:
-```bash
-# Install Python dependencies
-pip install fastapi uvicorn websockets orjson pydantic psutil
-
-# Install frontend dependencies
-cd frontend && npm install
-
-# Start dashboard
-python scripts/start_dashboard.py
-# Opens http://localhost:3000
-```
-
-**Enabling Visualization During Training**:
-```python
-# In config/settings.py, set:
-visualization: VisualizationConfig = field(default_factory=lambda: VisualizationConfig(enabled=True))
-
-# Or pass to AgentTrainingLogger:
-callback = AgentTrainingLogger(log_dir="models/agent", enable_visualization=True)
-```
-
-**Key Files**:
-- `visualization/server.py`: FastAPI WebSocket server
-- `visualization/data_emitter.py`: Thread-safe training data broadcaster
-- `frontend/src/app/page.tsx`: Main dashboard layout
-- `frontend/src/components/charts/`: Chart components
-- `frontend/src/hooks/useWebSocket.ts`: WebSocket connection hook
 
 ## File Organization Specifics
 

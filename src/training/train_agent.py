@@ -45,14 +45,6 @@ from ..data.feature_names import (
 )
 from config.settings import SMCConfig
 
-# Visualization imports (optional, non-blocking)
-try:
-    from visualization import get_emitter
-    VISUALIZATION_AVAILABLE = True
-except ImportError:
-    VISUALIZATION_AVAILABLE = False
-    get_emitter = None
-
 logger = get_logger(__name__)
 
 
@@ -71,8 +63,7 @@ class AgentTrainingLogger(BaseCallback):
         self,
         log_dir: Optional[str] = None,
         log_freq: int = 1000,
-        verbose: int = 1,
-        enable_visualization: bool = False
+        verbose: int = 1
     ):
         super().__init__(verbose)
         self.log_dir = Path(log_dir) if log_dir else None
@@ -95,13 +86,6 @@ class AgentTrainingLogger(BaseCallback):
 
         # Training start time
         self.start_time = None
-
-        # Visualization emitter (non-blocking)
-        self.enable_visualization = enable_visualization and VISUALIZATION_AVAILABLE
-        self.emitter = get_emitter() if self.enable_visualization else None
-        self.bar_counter = 0  # Incrementing counter for continuous chart timestamps
-        self.last_price_emitted = 0.0  # Track last price to avoid duplicate bars
-        self._prev_price = 0.0  # Previous price for OHLC generation
 
         if self.log_dir:
             self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -169,199 +153,14 @@ class AgentTrainingLogger(BaseCallback):
             if n_episodes % 10 == 0:
                 self._log_episode_summary(n_episodes)
 
-            # Emit episode end to visualization
-            if self.emitter is not None:
-                try:
-                    self.emitter.push_episode_end(
-                        episode=n_episodes,
-                        episode_reward=self.current_ep_reward,
-                        episode_pnl=self.episode_pnls[-1] if self.episode_pnls else 0.0,
-                        episode_trades=self.episode_trades[-1] if self.episode_trades else 0,
-                        win_rate=win_rate,
-                        episode_length=self.current_ep_length,
-                    )
-                except Exception:
-                    pass
-
             # Reset current episode tracking
             self.current_ep_reward = 0
             self.current_ep_length = 0
             self.current_ep_actions = []
-            self.last_price_emitted = 0.0  # Reset price tracker for new episode
-            # NOTE: bar_counter NOT reset - keep timestamps continuous for proper chart display
-            self._prev_price = 0.0  # Reset previous price for OHLC
 
         # Periodic detailed logging
         if self.n_calls % self.log_freq == 0:
             self._log_training_progress()
-
-        # Emit to visualization dashboard (non-blocking)
-        if self.emitter is not None:
-            try:
-                infos = self.locals.get('infos', [{}])
-                info = infos[0] if infos else {}
-
-                # Get action details
-                action = self.locals.get('actions', [[0, 0]])[0]
-                action_direction = int(action[0]) if isinstance(action, np.ndarray) and len(action) >= 1 else 0
-                action_size = int(action[1]) if isinstance(action, np.ndarray) and len(action) >= 2 else 0
-
-                # Get reward
-                reward = self.locals.get('rewards', [0])[0] if len(self.locals.get('rewards', [])) > 0 else 0
-
-                # Emit step data
-                # Emit step data
-                
-                # --- NEW METRICS EXTRACTION ---
-                action_probs = None
-                size_probs = None
-                value_estimate = 0.0
-                entropy = 0.0
-                
-                try:
-                    if 'new_obs' in self.locals:
-                        obs = self.locals['new_obs']
-                        # Ensure obs is correct shape/type for policy
-                        obs_tensor = torch.as_tensor(obs).to(self.model.device)
-                        
-                        with torch.no_grad():
-                            # Value estimate
-                            values = self.model.policy.predict_values(obs_tensor)
-                            value_estimate = values[0].item()
-                            
-                            # Action probabilities
-                            # For MlpPolicy with MultiDiscrete, we need to extract features then logits
-                            features = self.model.policy.extract_features(obs_tensor)
-                            latent_pi = self.model.policy.mlp_extractor.forward_actor(features)
-                            logits = self.model.policy.action_net(latent_pi)
-                            
-                            # Split logits: [3, 4] -> first 3 for direction, next 4 for size
-                            action_logits = logits[:, :3]
-                            size_logits = logits[:, 3:]
-                            
-                            # Softmax
-                            action_probs_t = torch.softmax(action_logits, dim=1)
-                            size_probs_t = torch.softmax(size_logits, dim=1)
-                            
-                            action_probs = action_probs_t[0].cpu().numpy().tolist()
-                            size_probs = size_probs_t[0].cpu().numpy().tolist()
-                            
-                            # Approximate entropy
-                            dist = self.model.policy.get_distribution(obs_tensor)
-                            entropy = dist.entropy().mean().item()
-                            
-                except Exception:
-                    pass
-                
-                # Construct reward components
-                reward_components = {
-                    'pnl_delta': info.get('pnl_delta', 0.0),
-                    'direction_bonus': 0.0,  # REMOVED: Was causing reward-PnL divergence
-                    'confidence_bonus': info.get('confidence_bonus', 0.0),
-                    'fomo_penalty': -0.05 if info.get('fomo_triggered') else 0.0,
-                    'chop_penalty': -0.01 if info.get('chop_triggered') else 0.0,
-                    'transaction_cost': 0.0, # Hard to track exact cost here without env access
-                    'total': float(reward)
-                }
-                # ------------------------------
-
-                # Get timestamp for trade markers (use real timestamp if available)
-                if 'ohlc' in info and 'timestamp' in info['ohlc']:
-                    current_bar_timestamp = info['ohlc']['timestamp']
-                else:
-                    # Fallback to synthetic timestamp (5-minute bars)
-                    base_timestamp = 1700000000
-                    current_bar_timestamp = base_timestamp + (self.bar_counter * 300)
-
-                # Emit trade events with proper timestamp
-                if info.get('trade_opened'):
-                    self.emitter.push_trade(
-                        price=info.get('entry_price', 0.0),
-                        direction=info.get('position', 0),
-                        size=info.get('position_size', 0.0),
-                        is_entry=True,
-                        timestamp=current_bar_timestamp,
-                    )
-                if info.get('trade_closed'):
-                    self.emitter.push_trade(
-                        price=info.get('current_price', 0.0),
-                        direction=info.get('close_direction', 0),
-                        size=info.get('close_size', 0.0),
-                        is_entry=False,
-                        pnl=info.get('pnl', 0.0),
-                        close_reason=info.get('close_reason', 'exit'),
-                        timestamp=current_bar_timestamp,
-                    )
-                    
-                # Extract OHLC from the environment for visualization
-                # Use REAL OHLC data from environment if available
-                ohlc_data = None
-                try:
-                    # Check if environment provides real OHLC data
-                    if 'ohlc' in info:
-                        # Use real OHLC from the trading data
-                        real_ohlc = info['ohlc']
-                        ohlc_data = {
-	                            'timestamp': real_ohlc.get('timestamp', 1700000000 + (self.bar_counter * 300)),
-                            'open': real_ohlc['open'],
-                            'high': real_ohlc['high'],
-                            'low': real_ohlc['low'],
-                            'close': real_ohlc['close'],
-                        }
-                        self.bar_counter += 1
-                    else:
-                        # Fallback: Create synthetic OHLC from current_price
-                        current_price = info.get('current_price', 0.0)
-                        if current_price > 0:
-                            prev_price = self._prev_price if self._prev_price > 0 else current_price
-                            base_timestamp = 1700000000  # Nov 2023
-                            bar_timestamp = base_timestamp + (self.bar_counter * 300)
-                            ohlc_data = {
-                                'timestamp': bar_timestamp,
-                                'open': prev_price,
-                                'high': max(prev_price, current_price),
-                                'low': min(prev_price, current_price),
-                                'close': current_price,
-                            }
-                            self.bar_counter += 1
-                            self._prev_price = current_price
-                             
-                except Exception:
-                    pass
-                
-                self.emitter.push_agent_step(
-                    timestep=self.n_calls,
-                    episode=len(self.episode_rewards),
-                    reward=float(reward),
-                    action_direction=action_direction,
-                    action_size=action_size,
-                    position=info.get('position', 0),
-                    position_size=info.get('position_size', 0.0),
-                    entry_price=info.get('entry_price'),
-                    current_price=info.get('current_price', 0.0),
-                    unrealized_pnl=info.get('unrealized_pnl', 0.0),
-                    total_pnl=info.get('total_pnl', 0.0),
-                    n_trades=info.get('n_trades', 0),
-                    atr=info.get('atr', 0.0),
-                    chop=info.get('chop', 50.0),
-                    adx=info.get('adx', 25.0),
-                    regime=info.get('regime', 1),
-                    sma_distance=info.get('sma_distance', 0.0),
-                    p_down=info.get('p_down', 0.5),
-                    p_up=info.get('p_up', 0.5),
-                    attention_weights=info.get('attention_weights'),
-                    sl_level=info.get('sl_level'),
-                    tp_level=info.get('tp_level'),
-                    # New metrics
-                    value_estimate=value_estimate,
-                    action_probs=action_probs,
-                    size_probs=size_probs,
-                    reward_components=reward_components,
-                    ohlc=ohlc_data,  # Add OHLC data
-                    activations=info.get('analyst_activations'), # Add activations
-                )
-            except Exception:
-                pass  # Never block training
 
         return True
 
@@ -1263,8 +1062,7 @@ def train_agent(
     training_callback = AgentTrainingLogger(
         log_dir=str(log_dir),
         log_freq=5000,
-        verbose=1,
-        enable_visualization=config.visualization.enabled
+        verbose=1
     )
 
     # Train

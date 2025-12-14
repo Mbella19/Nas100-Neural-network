@@ -677,8 +677,6 @@ def main():
     parser.add_argument('--skip-agent', action='store_true', help='Skip agent training (use existing model)')
     parser.add_argument('--analyst-only', action='store_true', help='Run ONLY data processing and analyst training')
     parser.add_argument('--backtest-only', action='store_true', help='Only run backtest with existing models')
-    parser.add_argument('--visualization', '-v', action='store_true',
-                       help='Enable real-time visualization dashboard')
     parser.add_argument('--resume', type=str, help='Path to checkpoint to resume training from')
     parser.add_argument('--model-path', type=str, help='Path to specific agent model for backtesting')
     parser.add_argument('--min-confidence', type=float, default=0.0, help='Minimum confidence threshold (0.0-1.0)')
@@ -692,11 +690,6 @@ def main():
     logger.info("=" * 60)
 
     config = Config()
-
-    # Enable visualization if requested
-    if args.visualization:
-        config.visualization.enabled = True
-        logger.info("Real-time visualization ENABLED - start dashboard with: python scripts/start_dashboard.py")
     device = get_device()
     logger.info(f"Using device: {device}")
     logger.info(f"PyTorch version: {torch.__version__}")

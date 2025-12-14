@@ -50,12 +50,6 @@ from ..utils.metrics import (
 )
 from ..utils.visualization import TrainingVisualizer
 
-# Optional frontend visualization emitter
-try:
-    from visualization.data_emitter import get_emitter  # type: ignore
-except ImportError:  # Visualization package not required for training
-    get_emitter = None
-
 logger = get_logger(__name__)
 
 
@@ -959,9 +953,6 @@ class AnalystTrainer:
         # Batch-level tracking
         self.batch_losses = []
         self.batch_grad_norms = []
-        
-        # Data emitter for frontend visualization (optional)
-        self.emitter = get_emitter() if get_emitter is not None else None
 
     def train_epoch(
         self,
@@ -1155,31 +1146,6 @@ class AnalystTrainer:
                 'grad': f'{grad_norm:.4f}',
                 'lr': f'{current_lr:.2e}'
             })
-
-            # Emit data to frontend (throttled)
-            if self.emitter is not None and batch_idx % 5 == 0:  # Emit every 5 batches
-                # Get activations for visualization
-                activations = None
-                if hasattr(self.model, 'get_activations'):
-                    with torch.no_grad():
-                        _, activations_tensor = self.model.get_activations(
-                            x_15m, x_1h, x_4h,
-                            **model_kwargs
-                        )
-                        # Convert tensors to lists for JSON serialization
-                        activations = {
-                            k: v[0].cpu().numpy().tolist() for k, v in activations_tensor.items()
-                        }
-
-                self.emitter.push_analyst_epoch(
-                    epoch=epoch,
-                    train_loss=loss_val,
-                    val_loss=0.0, # Not available yet
-                    train_acc=metrics_tracker.compute().get('accuracy', 0.0),
-                    learning_rate=current_lr,
-                    grad_norm=grad_norm,
-                    activations=activations
-                )
 
             # Clean up batch tensors
             del x_15m, x_1h, x_4h, component_data, targets, logits, pred_classes, loss
